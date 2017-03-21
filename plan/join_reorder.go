@@ -26,8 +26,8 @@ func tryToGetJoinGroup(j *Join) ([]LogicalPlan, bool) {
 	if j.reordered || !j.cartesianJoin {
 		return nil, false
 	}
-	lChild := j.GetChildByIndex(0).(LogicalPlan)
-	rChild := j.GetChildByIndex(1).(LogicalPlan)
+	lChild := j.children[0].(LogicalPlan)
+	rChild := j.children[1].(LogicalPlan)
 	if nj, ok := lChild.(*Join); ok {
 		plans, valid := tryToGetJoinGroup(nj)
 		return append(plans, rChild), valid
@@ -37,8 +37,7 @@ func tryToGetJoinGroup(j *Join) ([]LogicalPlan, bool) {
 
 func findColumnIndexByGroup(groups []LogicalPlan, col *expression.Column) int {
 	for i, plan := range groups {
-		idx := plan.GetSchema().GetIndex(col)
-		if idx != -1 {
+		if plan.Schema().Contains(col) {
 			return i
 		}
 	}
@@ -104,8 +103,8 @@ func (e *joinReOrderSolver) reorderJoin(group []LogicalPlan, conds []expression.
 	for _, cond := range conds {
 		if f, ok := cond.(*expression.ScalarFunction); ok {
 			if f.FuncName.L == ast.EQ {
-				lCol, lok := f.Args[0].(*expression.Column)
-				rCol, rok := f.Args[1].(*expression.Column)
+				lCol, lok := f.GetArgs()[0].(*expression.Column)
+				rCol, rok := f.GetArgs()[1].(*expression.Column)
 				if lok && rok {
 					lID := findColumnIndexByGroup(group, lCol)
 					rID := findColumnIndexByGroup(group, rCol)
@@ -118,7 +117,7 @@ func (e *joinReOrderSolver) reorderJoin(group []LogicalPlan, conds []expression.
 			}
 			id := -1
 			rate := 1.0
-			cols, _ := extractColumn(f, nil, nil)
+			cols := expression.ExtractColumns(f)
 			for _, col := range cols {
 				idx := findColumnIndexByGroup(group, col)
 				if id == -1 {
@@ -186,9 +185,9 @@ func (e *joinReOrderSolver) newJoin(lChild, rChild LogicalPlan) *Join {
 		baseLogicalPlan: newBaseLogicalPlan(Jn, e.allocator),
 	}
 	join.self = join
-	join.initID()
+	join.initIDAndContext(lChild.context())
 	join.SetChildren(lChild, rChild)
-	join.SetSchema(append(lChild.GetSchema().Clone(), rChild.GetSchema().Clone()...))
+	join.SetSchema(expression.MergeSchema(lChild.Schema(), rChild.Schema()))
 	lChild.SetParents(join)
 	rChild.SetParents(join)
 	return join

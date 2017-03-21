@@ -14,8 +14,7 @@
 package ddl
 
 import (
-	"fmt"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juju/errors"
@@ -24,96 +23,30 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/mock"
 )
 
-var _ context.Context = &mockContext{}
-
-// mockContext implements context.Context interface for testing.
-type mockContext struct {
-	store kv.Storage
-	mux   sync.Mutex
-	m     map[fmt.Stringer]interface{}
-	txn   kv.Transaction
-}
-
-func (c *mockContext) GetTxn(forceNew bool) (kv.Transaction, error) {
-	c.mux.Lock()
-	defer c.mux.Unlock()
-	if forceNew {
-		if c.txn != nil {
-			if err := c.txn.Commit(); err != nil {
-				return nil, errors.Trace(err)
-			}
-			c.txn = nil
-		}
-	}
-	if c.txn != nil {
-		return c.txn, nil
-	}
-
-	txn, err := c.store.Begin()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	c.txn = txn
-	return c.txn, nil
-}
-
-func (c *mockContext) finishTxn(rollback bool) error {
-	if c.txn == nil {
-		return nil
-	}
-
-	var err error
-	if rollback {
-		err = c.txn.Rollback()
-	} else {
-		err = c.txn.Commit()
-	}
-
-	c.txn = nil
-
-	return errors.Trace(err)
-}
-
-func (c *mockContext) RollbackTxn() error {
-	return c.finishTxn(true)
-}
-
-func (c *mockContext) CommitTxn() error {
-	return c.finishTxn(false)
-}
-
-func (c *mockContext) GetClient() kv.Client {
-	return c.store.GetClient()
-}
-
-func (c *mockContext) SetValue(key fmt.Stringer, value interface{}) {
-	c.m[key] = value
-}
-
-func (c *mockContext) Value(key fmt.Stringer) interface{} {
-	return c.m[key]
-}
-
-func (c *mockContext) ClearValue(key fmt.Stringer) {
-	delete(c.m, key)
-}
-
-func (d *ddl) newMockContext() context.Context {
-	c := &mockContext{
-		store: d.store,
-		m:     make(map[fmt.Stringer]interface{}),
-	}
-
+// newContext gets a context. It is only used for adding column in reorganization state.
+func (d *ddl) newContext() context.Context {
+	c := mock.NewContext()
+	c.Store = d.store
+	c.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, false)
 	return c
 }
 
 const waitReorgTimeout = 10 * time.Second
 
-func (d *ddl) runReorgJob(f func() error) error {
+func (d *ddl) setReorgRowCount(count int64) {
+	atomic.StoreInt64(&d.reorgRowCount, count)
+}
+
+func (d *ddl) getReorgRowCount() int64 {
+	return atomic.LoadInt64(&d.reorgRowCount)
+}
+
+func (d *ddl) runReorgJob(job *model.Job, f func() error) error {
 	if d.reorgDoneCh == nil {
 		// start a reorganization job
 		d.wait.Add(1)
@@ -139,14 +72,20 @@ func (d *ddl) runReorgJob(f func() error) error {
 	case err := <-d.reorgDoneCh:
 		log.Info("[ddl] run reorg job done")
 		d.reorgDoneCh = nil
+		// Update a job's RowCount.
+		job.SetRowCount(d.getReorgRowCount())
+		d.setReorgRowCount(0)
 		return errors.Trace(err)
 	case <-d.quitCh:
 		log.Info("[ddl] run reorg job ddl quit")
-		// we return errWaitReorgTimeout here too, so that outer loop will break.
+		d.setReorgRowCount(0)
+		// We return errWaitReorgTimeout here too, so that outer loop will break.
 		return errWaitReorgTimeout
 	case <-time.After(waitTimeout):
-		log.Infof("[ddl] run reorg job wait timeout :%v", waitTimeout)
-		// if timeout, we will return, check the owner and retry to wait job done again.
+		log.Infof("[ddl] run reorg job wait timeout %v", waitTimeout)
+		// Update a job's RowCount.
+		job.SetRowCount(d.getReorgRowCount())
+		// If timeout, we will return, check the owner and retry to wait job done again.
 		return errWaitReorgTimeout
 	}
 }
@@ -154,7 +93,7 @@ func (d *ddl) runReorgJob(f func() error) error {
 func (d *ddl) isReorgRunnable(txn kv.Transaction, flag JobType) error {
 	if d.isClosed() {
 		// worker is closed, can't run reorganization.
-		return errors.Trace(errInvalidWorker.Gen("worker is closed"))
+		return errInvalidWorker.Gen("worker is closed")
 	}
 
 	t := meta.NewMeta(txn)
@@ -231,7 +170,9 @@ func (d *ddl) delKeysWithStartKey(prefix, startKey kv.Key, jobType JobType, job 
 			return 0, startKey, errors.Trace(err)
 		}
 
+		// Update the background job's RowCount.
 		job.SetRowCount(total)
+		d.setReorgRowCount(total)
 		batchHandleDataHistogram.WithLabelValues(batchDelData).Observe(sub)
 		log.Infof("[ddl] deleted %d keys take time %v, deleted %d keys in total", len(keys), sub, total)
 
@@ -247,18 +188,6 @@ func (d *ddl) delKeysWithStartKey(prefix, startKey kv.Key, jobType JobType, job 
 	}
 
 	return count, startKey, nil
-}
-
-// addDBHistoryInfo adds schema version and schema information that are used for binlog.
-// dbInfo is added in the following operations: create database, drop database.
-func addDBHistoryInfo(job *model.Job, ver int64, dbInfo *model.DBInfo) {
-	job.Args = []interface{}{ver, dbInfo}
-}
-
-// addTableHistoryInfo adds schema version and table information that are used for binlog.
-// tblInfo is added except for the following operations: create database, drop database.
-func addTableHistoryInfo(job *model.Job, ver int64, tblInfo *model.TableInfo) {
-	job.Args = []interface{}{ver, tblInfo}
 }
 
 type reorgInfo struct {

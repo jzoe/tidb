@@ -26,11 +26,11 @@ func ToString(p Plan) string {
 
 func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 	switch in.(type) {
-	case *Join, *Union, *PhysicalHashJoin, *PhysicalHashSemiJoin:
+	case *Join, *Union, *PhysicalHashJoin, *PhysicalHashSemiJoin, *Apply, *PhysicalApply:
 		idxs = append(idxs, len(strs))
 	}
 
-	for _, c := range in.GetChildren() {
+	for _, c := range in.Children() {
 		strs, idxs = toString(c, strs, idxs)
 	}
 
@@ -56,8 +56,8 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			str = "LeftHashJoin{" + strings.Join(children, "->") + "}"
 		}
 		for _, eq := range x.EqualConditions {
-			l := eq.Args[0].String()
-			r := eq.Args[1].String()
+			l := eq.GetArgs()[0].String()
+			r := eq.GetArgs()[1].String()
 			str += fmt.Sprintf("(%s,%s)", l, r)
 		}
 	case *PhysicalHashSemiJoin:
@@ -71,10 +71,13 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		} else {
 			str = "SemiJoin{" + strings.Join(children, "->") + "}"
 		}
-	case *Apply:
-		str = fmt.Sprintf("Apply(%s)", ToString(x.InnerPlan))
-	case *PhysicalApply:
-		str = fmt.Sprintf("Apply(%s)", ToString(x.InnerPlan))
+	case *Apply, *PhysicalApply:
+		last := len(idxs) - 1
+		idx := idxs[last]
+		children := strs[idx:]
+		strs = strs[:idx]
+		idxs = idxs[:last]
+		str = "Apply{" + strings.Join(children, "->") + "}"
 	case *Exists:
 		str = "Exists"
 	case *MaxOneRow:
@@ -97,6 +100,11 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		strs = strs[:idx]
 		str = "Join{" + strings.Join(children, "->") + "}"
 		idxs = idxs[:last]
+		for _, eq := range x.EqualConditions {
+			l := eq.GetArgs()[0].String()
+			r := eq.GetArgs()[1].String()
+			str += fmt.Sprintf("(%s,%s)", l, r)
+		}
 	case *Union:
 		last := len(idxs) - 1
 		idx := idxs[last]
@@ -105,7 +113,11 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		str = "UnionAll{" + strings.Join(children, "->") + "}"
 		idxs = idxs[:last]
 	case *DataSource:
-		str = fmt.Sprintf("DataScan(%v)", x.Table.Name.L)
+		if x.TableAsName != nil && x.TableAsName.L != "" {
+			str = fmt.Sprintf("DataScan(%s)", x.TableAsName)
+		} else {
+			str = fmt.Sprintf("DataScan(%s)", x.tableInfo.Name)
+		}
 	case *Selection:
 		str = "Selection"
 	case *Projection:
@@ -126,10 +138,8 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			}
 		}
 		str += ")"
-	case *Distinct:
-		str = "Distinct"
-	case *Trim:
-		str = "Trim"
+	case *Cache:
+		str = "Cache"
 	default:
 		str = fmt.Sprintf("%T", in)
 	}

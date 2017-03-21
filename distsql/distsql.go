@@ -24,9 +24,11 @@ import (
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/bytespool"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/types"
 	"github.com/pingcap/tipb/go-tipb"
+	goctx "golang.org/x/net/context"
 )
 
 var (
@@ -49,7 +51,7 @@ type SelectResult interface {
 	Close() error
 	// Fetch fetches partial results from client.
 	// The caller should call SetFields() before call Fetch().
-	Fetch()
+	Fetch(ctx goctx.Context)
 	// IgnoreData sets ignore data attr to true.
 	// For index double scan, we do not need row data when scanning index.
 	IgnoreData()
@@ -72,22 +74,36 @@ type selectResult struct {
 	resp       kv.Response
 	ignoreData bool
 
-	results chan PartialResult
-	done    chan error
-
-	closed chan struct{}
+	results chan resultWithErr
+	closed  chan struct{}
 }
 
-func (r *selectResult) Fetch() {
-	go r.fetch()
+type resultWithErr struct {
+	result PartialResult
+	err    error
 }
 
-func (r *selectResult) fetch() {
-	defer close(r.results)
+func (r *selectResult) Fetch(ctx goctx.Context) {
+	go r.fetch(ctx)
+}
+
+func (r *selectResult) fetch(ctx goctx.Context) {
+	startTime := time.Now()
+	defer func() {
+		close(r.results)
+		duration := time.Since(startTime)
+		var label string
+		if r.index {
+			label = "index"
+		} else {
+			label = "table"
+		}
+		queryHistgram.WithLabelValues(label).Observe(duration.Seconds())
+	}()
 	for {
 		reader, err := r.resp.Next()
 		if err != nil {
-			r.done <- errors.Trace(err)
+			r.results <- resultWithErr{err: errors.Trace(err)}
 			return
 		}
 		if reader == nil {
@@ -104,28 +120,20 @@ func (r *selectResult) fetch() {
 		go pr.fetch()
 
 		select {
-		case r.results <- pr:
+		case r.results <- resultWithErr{result: pr}:
 		case <-r.closed:
 			// if selectResult called Close() already, make fetch goroutine exit
+			return
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
 // Next returns the next row.
-func (r *selectResult) Next() (pr PartialResult, err error) {
-	var ok bool
-	select {
-	case pr, ok = <-r.results:
-	case err = <-r.done:
-	}
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, nil
-	}
-	return
+func (r *selectResult) Next() (PartialResult, error) {
+	re := <-r.results
+	return re.result, errors.Trace(re.err)
 }
 
 // SetFields sets select result field types.
@@ -163,12 +171,16 @@ type partialResult struct {
 func (pr *partialResult) fetch() {
 	defer close(pr.done)
 	pr.resp = new(tipb.SelectResponse)
-
-	b, err := ioutil.ReadAll(pr.reader)
-	pr.reader.Close()
-	if err != nil {
-		pr.done <- errors.Trace(err)
-		return
+	var b []byte
+	var err error
+	if rc, ok := pr.reader.(*bytespool.ReadCloser); ok {
+		b = rc.SharedBytes()
+	} else {
+		b, err = ioutil.ReadAll(pr.reader)
+		if err != nil {
+			pr.done <- errors.Trace(err)
+			return
+		}
 	}
 
 	err = pr.resp.Unmarshal(b)
@@ -267,19 +279,17 @@ func (pr *partialResult) getChunk() *tipb.Chunk {
 
 // Close closes the sub result.
 func (pr *partialResult) Close() error {
-	return nil
+	return pr.reader.Close()
 }
 
 // Select do a select request, returns SelectResult.
-// conncurrency: The max concurrency for underlying coprocessor request.
+// concurrency: The max concurrency for underlying coprocessor request.
 // keepOrder: If the result should returned in key order. For example if we need keep data in order by
 //            scan index, we should set keepOrder to true.
-func Select(client kv.Client, req *tipb.SelectRequest, keyRanges []kv.KeyRange, concurrency int, keepOrder bool) (SelectResult, error) {
+func Select(client kv.Client, ctx goctx.Context, req *tipb.SelectRequest, keyRanges []kv.KeyRange, concurrency int, keepOrder bool) (SelectResult, error) {
 	var err error
-	startTs := time.Now()
 	defer func() {
 		// Add metrics
-		queryHistgram.Observe(time.Since(startTs).Seconds())
 		if err != nil {
 			queryCounter.WithLabelValues(queryFailed).Inc()
 		} else {
@@ -294,15 +304,14 @@ func Select(client kv.Client, req *tipb.SelectRequest, keyRanges []kv.KeyRange, 
 		return nil, err
 	}
 
-	resp := client.Send(kvReq)
+	resp := client.Send(ctx, kvReq)
 	if resp == nil {
 		err = errors.New("client returns nil response")
 		return nil, err
 	}
 	result := &selectResult{
 		resp:    resp,
-		results: make(chan PartialResult, 5),
-		done:    make(chan error, 1),
+		results: make(chan resultWithErr, 5),
 		closed:  make(chan struct{}),
 	}
 	// If Aggregates is not nil, we should set result fields latter.

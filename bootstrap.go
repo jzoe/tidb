@@ -115,6 +115,15 @@ const (
   		PRIMARY KEY (help_topic_id),
   		UNIQUE KEY name (name)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8 STATS_PERSISTENT=0 COMMENT='help topics';`
+
+	// CreateStatsMetaTable store's the meta of table statistics.
+	CreateStatsMetaTable = `CREATE TABLE if not exists mysql.stats_meta (
+		version bigint(64) unsigned NOT NULL,
+		table_id bigint(64) NOT NULL,
+		modify_count bigint(64) NOT NULL DEFAULT 0,
+		count bigint(64) unsigned NOT NULL DEFAULT 0,
+		index idx_ver(version)
+	);`
 )
 
 // Bootstrap initiates system DB for a store.
@@ -124,11 +133,7 @@ func bootstrap(s Session) {
 		log.Fatal(err)
 	}
 	if b {
-		err = upgrade(s)
-		if err != nil {
-			log.Fatal(err)
-		}
-		return
+		upgrade(s)
 	}
 	doDDLWorks(s)
 	doDMLWorks(s)
@@ -147,6 +152,7 @@ const (
 	// Const for TiDB server version 2.
 	version2 = 2
 	version3 = 3
+	version4 = 4
 )
 
 func checkBootstrapped(s Session) (bool, error) {
@@ -195,18 +201,18 @@ func getTiDBVar(s Session, name string) (types.Datum, error) {
 
 // When the system is boostrapped by low version TiDB server, we should do some upgrade works.
 // For example, add new system variables into mysql.global_variables table.
-func upgrade(s Session) error {
+func upgrade(s Session) {
 	ver, err := getBootstrapVersion(s)
 	if err != nil {
-		return errors.Trace(err)
+		log.Fatal(errors.Trace(err))
 	}
 	if ver >= currentBootstrapVersion {
 		// It is already bootstrapped/upgraded by a higher version TiDB server.
 		if err1 := s.CommitTxn(); err1 != nil {
 			// Make sure that doesn't affect the following operations.
-			return errors.Trace(err1)
+			log.Fatal(errors.Trace(err1))
 		}
-		return nil
+		return
 	}
 	// Do upgrade works then update bootstrap version.
 	if ver < version2 {
@@ -215,6 +221,9 @@ func upgrade(s Session) error {
 	}
 	if ver < version3 {
 		upgradeToVer3(s)
+	}
+	if ver < version4 {
+		upgradeToVer4(s)
 	}
 
 	updateBootstrapVer(s)
@@ -231,14 +240,14 @@ func upgrade(s Session) error {
 			// It is already bootstrapped/upgraded by a higher version TiDB server.
 			if err1 := s.CommitTxn(); err1 != nil {
 				// Make sure that doesn't affect the following operations.
-				return errors.Trace(err1)
+				log.Fatal(errors.Trace(err1))
 			}
-			return nil
+			return
 		}
 		log.Errorf("[Upgrade] upgrade from %d to %d error", ver, currentBootstrapVersion)
 		log.Fatal(err)
 	}
-	return nil
+	return
 }
 
 // Update to version 2.
@@ -261,6 +270,12 @@ func upgradeToVer3(s Session) {
 	// Version 3 fix tx_read_only variable value.
 	sql := fmt.Sprintf("UPDATE %s.%s set variable_value = '0' where variable_name = 'tx_read_only';",
 		mysql.SystemDB, mysql.GlobalVariablesTable)
+	mustExecute(s, sql)
+}
+
+// Update to version 4.
+func upgradeToVer4(s Session) {
+	sql := CreateStatsMetaTable
 	mustExecute(s, sql)
 }
 
@@ -302,6 +317,8 @@ func doDDLWorks(s Session) {
 	mustExecute(s, CreateTiDBTable)
 	// Create help table.
 	mustExecute(s, CreateHelpTopic)
+	// Create stats_meta table.
+	mustExecute(s, CreateStatsMetaTable)
 }
 
 // Execute DML statements in bootstrap stage.
@@ -316,8 +333,11 @@ func doDMLWorks(s Session) {
 	// Init global system variables table.
 	values := make([]string, 0, len(variable.SysVars))
 	for k, v := range variable.SysVars {
-		value := fmt.Sprintf(`("%s", "%s")`, strings.ToLower(k), v.Value)
-		values = append(values, value)
+		// Session only variable should not be inserted.
+		if v.Scope != variable.ScopeSession {
+			value := fmt.Sprintf(`("%s", "%s")`, strings.ToLower(k), v.Value)
+			values = append(values, value)
+		}
 	}
 	sql := fmt.Sprintf("INSERT INTO %s.%s VALUES %s;", mysql.SystemDB, mysql.GlobalVariablesTable,
 		strings.Join(values, ", "))
@@ -328,7 +348,7 @@ func doDMLWorks(s Session) {
 		mysql.SystemDB, mysql.TiDBTable, bootstrappedVar, bootstrappedVarTrue, bootstrappedVarTrue)
 	mustExecute(s, sql)
 
-	sql = fmt.Sprintf(`INSERT INTO %s.%s VALUES("%s", "%d", "Bootstrap version. Do not delete")`,
+	sql = fmt.Sprintf(`INSERT INTO %s.%s VALUES("%s", "%d", "Bootstrap version. Do not delete.")`,
 		mysql.SystemDB, mysql.TiDBTable, tidbServerVersionVar, currentBootstrapVersion)
 	mustExecute(s, sql)
 

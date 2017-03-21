@@ -27,7 +27,7 @@ import (
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/store/tikv/mock-tikv"
 	"github.com/pingcap/tidb/store/tikv/oracle"
-	"golang.org/x/net/context"
+	goctx "golang.org/x/net/context"
 )
 
 type testStoreSuite struct {
@@ -42,7 +42,8 @@ func (s *testStoreSuite) SetUpTest(c *C) {
 	mocktikv.BootstrapWithSingleStore(s.cluster)
 	mvccStore := mocktikv.NewMvccStore()
 	clientFactory := mocktikv.NewRPCClient(s.cluster, mvccStore)
-	store, err := newTikvStore("mock-tikv-store", mocktikv.NewPDClient(s.cluster), clientFactory, false)
+	pdCli := &codecPDClient{mocktikv.NewPDClient(s.cluster)}
+	store, err := newTikvStore("mock-tikv-store", pdCli, clientFactory, false)
 	c.Assert(err, IsNil)
 	s.store = store
 }
@@ -64,7 +65,7 @@ func (s *testStoreSuite) TestOracle(c *C) {
 	o := &mockOracle{}
 	s.store.oracle = o
 
-	ctx := context.Background()
+	ctx := goctx.Background()
 	t1, err := s.store.getTimestampWithRetry(NewBackoffer(100, ctx))
 	c.Assert(err, IsNil)
 	t2, err := s.store.getTimestampWithRetry(NewBackoffer(100, ctx))
@@ -130,6 +131,8 @@ func (s *testStoreSuite) TestBusyServerKV(c *C) {
 func (s *testStoreSuite) TestBusyServerCop(c *C) {
 	client := newBusyClient(s.store.client)
 	s.store.client = client
+	_, err := tidb.BootstrapSession(s.store)
+	c.Assert(err, IsNil)
 
 	session, err := tidb.CreateSession(s.store)
 	c.Assert(err, IsNil)
@@ -244,7 +247,7 @@ func (c *busyClient) Close() error {
 	return c.client.Close()
 }
 
-func (c *busyClient) SendKVReq(addr string, req *kvrpcpb.Request, timeout time.Duration) (*kvrpcpb.Response, error) {
+func (c *busyClient) SendKVReq(ctx goctx.Context, addr string, req *kvrpcpb.Request, timeout time.Duration) (*kvrpcpb.Response, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -255,10 +258,10 @@ func (c *busyClient) SendKVReq(addr string, req *kvrpcpb.Request, timeout time.D
 			},
 		}, nil
 	}
-	return c.client.SendKVReq(addr, req, timeout)
+	return c.client.SendKVReq(ctx, addr, req, timeout)
 }
 
-func (c *busyClient) SendCopReq(addr string, req *coprocessor.Request, timeout time.Duration) (*coprocessor.Response, error) {
+func (c *busyClient) SendCopReq(ctx goctx.Context, addr string, req *coprocessor.Request, timeout time.Duration) (*coprocessor.Response, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -269,7 +272,7 @@ func (c *busyClient) SendCopReq(addr string, req *coprocessor.Request, timeout t
 			},
 		}, nil
 	}
-	return c.client.SendCopReq(addr, req, timeout)
+	return c.client.SendCopReq(ctx, addr, req, timeout)
 }
 
 type mockPDClient struct {
@@ -312,6 +315,16 @@ func (c *mockPDClient) GetRegion(key []byte) (*metapb.Region, *metapb.Peer, erro
 		return nil, nil, errors.Trace(errStopped)
 	}
 	return c.client.GetRegion(key)
+}
+
+func (c *mockPDClient) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer, error) {
+	c.RLock()
+	defer c.RUnlock()
+
+	if c.stop {
+		return nil, nil, errors.Trace(errStopped)
+	}
+	return c.client.GetRegionByID(regionID)
 }
 
 func (c *mockPDClient) GetStore(storeID uint64) (*metapb.Store, error) {

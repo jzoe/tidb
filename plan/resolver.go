@@ -22,8 +22,6 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/db"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/types"
 )
@@ -31,7 +29,7 @@ import (
 // ResolveName resolves table name and column name.
 // It generates ResultFields for ResultSetNode and resolves ColumnNameExpr to a ResultField.
 func ResolveName(node ast.Node, info infoschema.InfoSchema, ctx context.Context) error {
-	defaultSchema := db.GetCurrentSchema(ctx)
+	defaultSchema := ctx.GetSessionVars().CurrentDB
 	resolver := nameResolver{Info: info, Ctx: ctx, DefaultSchema: model.NewCIStr(defaultSchema)}
 	node.Accept(&resolver)
 	return errors.Trace(resolver.Err)
@@ -156,6 +154,12 @@ func (nr *nameResolver) Enter(inNode ast.Node) (outNode ast.Node, skipChildren b
 		}
 	case *ast.AlterTableStmt:
 		nr.pushContext()
+		for _, spec := range v.Specs {
+			if spec.Tp == ast.AlterTableRenameTable {
+				nr.currentContext().inCreateOrDropTable = true
+				break
+			}
+		}
 	case *ast.AnalyzeTableStmt:
 		nr.pushContext()
 	case *ast.ByItem:
@@ -203,6 +207,9 @@ func (nr *nameResolver) Enter(inNode ast.Node) (outNode ast.Node, skipChildren b
 		nr.currentContext().inOnCondition = true
 	case *ast.OrderByClause:
 		nr.currentContext().inOrderBy = true
+	case *ast.RenameTableStmt:
+		nr.pushContext()
+		nr.currentContext().inCreateOrDropTable = true
 	case *ast.SelectStmt:
 		nr.pushContext()
 	case *ast.SetStmt:
@@ -288,6 +295,8 @@ func (nr *nameResolver) Leave(inNode ast.Node) (node ast.Node, ok bool) {
 		nr.currentContext().inByItemExpression = false
 	case *ast.PositionExpr:
 		nr.handlePosition(v)
+	case *ast.RenameTableStmt:
+		nr.popContext()
 	case *ast.SelectStmt:
 		ctx := nr.currentContext()
 		v.SetResultFields(ctx.fieldList)
@@ -367,9 +376,9 @@ func (nr *nameResolver) handleTableName(tn *ast.TableName) {
 		ast.ValueExpr
 		ast.ResultField
 	}, len(tn.TableInfo.Columns))
-	sVars := variable.GetSessionVars(nr.Ctx)
+	status := nr.Ctx.GetSessionVars().StmtCtx
 	for i, v := range tn.TableInfo.Columns {
-		if sVars.InUpdateStmt {
+		if status.InUpdateOrDeleteStmt {
 			switch v.State {
 			case model.StatePublic, model.StateWriteOnly, model.StateWriteReorganization:
 			default:
@@ -627,10 +636,6 @@ func (nr *nameResolver) resolveColumnInTableSources(cn *ast.ColumnNameExpr, tabl
 				matchAsName := rf.ColumnAsName.L != "" && rf.ColumnAsName.L == columnNameL
 				matchColumnName := rf.ColumnAsName.L == "" && rf.Column.Name.L == columnNameL
 				if matchAsName || matchColumnName {
-					if matchedResultField != nil {
-						nr.Err = errors.Errorf("column %s is ambiguous.", cn.Name.Name.O)
-						return true
-					}
 					matchedResultField = rf
 				}
 			}
@@ -674,12 +679,6 @@ func (nr *nameResolver) resolveColumnInResultFields(ctx *resolverContext, cn *as
 			}
 			if matched == nil {
 				matched = rf
-			} else {
-				sameColumn := matched.TableName == rf.TableName && matched.Column.Name.L == rf.Column.Name.L
-				if !sameColumn {
-					nr.Err = errors.Errorf("column %s is ambiguous.", cn.Name.Name.O)
-					return true
-				}
 			}
 		}
 	}
@@ -920,7 +919,7 @@ func (nr *nameResolver) fillShowFields(s *ast.ShowStmt) {
 			"sql_mode", "Definer", "character_set_client", "collation_connection", "Database Collation"}
 		ftypes = []byte{mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar,
 			mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar}
-	case ast.ShowProcedureStatus:
+	case ast.ShowProcedureStatus, ast.ShowEvents:
 		names = []string{}
 		ftypes = []byte{}
 	case ast.ShowIndex:

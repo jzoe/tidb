@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 	"github.com/pingcap/tipb/go-tipb"
+	goctx "golang.org/x/net/context"
 )
 
 func TestT(t *testing.T) {
@@ -59,11 +60,10 @@ func (s *testTableCodecSuite) TestGoroutineLeak(c *C) {
 
 	sr = &selectResult{
 		resp:    &mockResponse{},
-		results: make(chan PartialResult, 5),
-		done:    make(chan error, 1),
+		results: make(chan resultWithErr, 5),
 		closed:  make(chan struct{}),
 	}
-	go sr.Fetch()
+	go sr.Fetch(goctx.TODO())
 	for {
 		// mock test will generate some partial result then return error
 		_, err := sr.Next()

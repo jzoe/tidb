@@ -19,11 +19,11 @@ import (
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/db"
 )
 
 var (
 	_ StmtNode = &AdminStmt{}
+	_ StmtNode = &AlterUserStmt{}
 	_ StmtNode = &BeginStmt{}
 	_ StmtNode = &BinlogStmt{}
 	_ StmtNode = &CommitStmt{}
@@ -39,7 +39,8 @@ var (
 	_ StmtNode = &SetStmt{}
 	_ StmtNode = &UseStmt{}
 	_ StmtNode = &AnalyzeTableStmt{}
-	_ StmtNode = &FlushTableStmt{}
+	_ StmtNode = &FlushStmt{}
+	_ StmtNode = &KillStmt{}
 
 	_ Node = &PrivElem{}
 	_ Node = &VariableAssignment{}
@@ -264,7 +265,7 @@ type VariableAssignment struct {
 	// VariableAssignment should be able to store information for SetCharset/SetPWD Stmt.
 	// For SetCharsetStmt, Value is charset, ExtendValue is collation.
 	// TODO: Use SetStmt to implement set password statement.
-	ExtendValue ExprNode
+	ExtendValue *ValueExpr
 }
 
 // Accept implements Node interface.
@@ -282,23 +283,62 @@ func (n *VariableAssignment) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// FlushTableStmt is the statement to flush table.
-// if Tables is empty, it means flush all tables.
-type FlushTableStmt struct {
+// FlushStmtType is the type for FLUSH statement.
+type FlushStmtType int
+
+// Flush statement types.
+const (
+	FlushNone FlushStmtType = iota
+	FlushTables
+	FlushPrivileges
+)
+
+// FlushStmt is a statement to flush tables/privileges/optimizer costs and so on.
+type FlushStmt struct {
 	stmtNode
 
-	Tables          []*TableName
+	Tp              FlushStmtType // Privileges/Tables/...
 	NoWriteToBinLog bool
-	ReadLock        bool
+	// For FlushTableStmt, if Tables is empty, it means flush all tables.
+	Tables   []*TableName
+	ReadLock bool
 }
 
 // Accept implements Node Accept interface.
-func (n *FlushTableStmt) Accept(v Visitor) (Node, bool) {
+func (n *FlushStmt) Accept(v Visitor) (Node, bool) {
 	newNode, skipChildren := v.Enter(n)
 	if skipChildren {
 		return v.Leave(newNode)
 	}
-	n = newNode.(*FlushTableStmt)
+	n = newNode.(*FlushStmt)
+	return v.Leave(n)
+}
+
+// KillStmt is a statement to kill a query or connection.
+type KillStmt struct {
+	stmtNode
+
+	// If Query is true, terminates the statement the connection is currently executing, but leaves the connection itself intact.
+	// If Query is false, terminates the connection associated with the given ConnectionID, after terminating any statement the connection is executing.
+	Query        bool
+	ConnectionID uint64
+	// When the SQL grammar is "KILL TIDB [CONNECTION | QUERY] connectionID", TiDBExtension will be set.
+	// It's a special grammar extension in TiDB. This extension exists because, when the connection is:
+	// client -> LVS proxy -> TiDB, and type Ctrl+C in client, the following action will be executed:
+	// new a connection; kill xxx;
+	// kill command may send to the wrong TiDB, because the exists of LVS proxy, and kill the wrong session.
+	// So, "KILL TIDB" grammar is introduced, and it REQUIRES DIRECT client -> TiDB TOPOLOGY.
+	// TODO: The standard KILL grammar will be supported once we have global connectionID.
+	TiDBExtension bool
+}
+
+// Accept implements Node Accept interface.
+func (n *KillStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*KillStmt)
 	return v.Leave(n)
 }
 
@@ -388,6 +428,26 @@ func (n *CreateUserStmt) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*CreateUserStmt)
+	return v.Leave(n)
+}
+
+// AlterUserStmt modifies user account.
+// See https://dev.mysql.com/doc/refman/5.7/en/alter-user.html
+type AlterUserStmt struct {
+	stmtNode
+
+	IfExists    bool
+	CurrentAuth *AuthOption
+	Specs       []*UserSpec
+}
+
+// Accept implements Node Accept interface.
+func (n *AlterUserStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterUserStmt)
 	return v.Leave(n)
 }
 
@@ -526,6 +586,33 @@ type GrantLevel struct {
 	TableName string
 }
 
+// RevokeStmt is the struct for REVOKE statement.
+type RevokeStmt struct {
+	stmtNode
+
+	Privs      []*PrivElem
+	ObjectType ObjectTypeType
+	Level      *GrantLevel
+	Users      []*UserSpec
+}
+
+// Accept implements Node Accept interface.
+func (n *RevokeStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*RevokeStmt)
+	for i, val := range n.Privs {
+		node, ok := val.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Privs[i] = node.(*PrivElem)
+	}
+	return v.Leave(n)
+}
+
 // GrantStmt is the struct for GRANT statement.
 type GrantStmt struct {
 	stmtNode
@@ -534,6 +621,7 @@ type GrantStmt struct {
 	ObjectType ObjectTypeType
 	Level      *GrantLevel
 	Users      []*UserSpec
+	WithGrant  bool
 }
 
 // Accept implements Node Accept interface.
@@ -565,7 +653,7 @@ func (i Ident) Full(ctx context.Context) (full Ident) {
 	if i.Schema.O != "" {
 		full.Schema = i.Schema
 	} else {
-		full.Schema = model.NewCIStr(db.GetCurrentSchema(ctx))
+		full.Schema = model.NewCIStr(ctx.GetSessionVars().CurrentDB)
 	}
 	return
 }

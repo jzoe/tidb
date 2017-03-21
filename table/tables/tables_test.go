@@ -21,7 +21,6 @@ import (
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
@@ -50,6 +49,8 @@ func (ts *testSuite) SetUpSuite(c *C) {
 	store, err := driver.Open("memory")
 	c.Check(err, IsNil)
 	ts.store = store
+	_, err = tidb.BootstrapSession(store)
+	c.Assert(err, IsNil)
 	ts.se, err = tidb.CreateSession(ts.store)
 	c.Assert(err, IsNil)
 }
@@ -58,6 +59,7 @@ func (ts *testSuite) TestBasic(c *C) {
 	_, err := ts.se.Execute("CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
+	c.Assert(ctx.NewTxn(), IsNil)
 	dom := sessionctx.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
@@ -118,18 +120,13 @@ func (ts *testSuite) TestBasic(c *C) {
 	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
 	c.Assert(err, IsNil)
 	c.Assert(indexCnt(), Greater, 0)
-
 	_, err = ts.se.Execute("drop table test.t")
 	c.Assert(err, IsNil)
 }
 
 func countEntriesWithPrefix(ctx context.Context, prefix []byte) (int, error) {
-	txn, err := ctx.GetTxn(false)
-	if err != nil {
-		return 0, err
-	}
 	cnt := 0
-	err = util.ScanMetaWithPrefix(txn, prefix, func(k kv.Key, v []byte) bool {
+	err := util.ScanMetaWithPrefix(ctx.Txn(), prefix, func(k kv.Key, v []byte) bool {
 		cnt++
 		return true
 	})
@@ -162,7 +159,7 @@ func (ts *testSuite) TestTypes(c *C) {
 	row, err = rs[0].Next()
 	c.Assert(err, IsNil)
 	c.Assert(row.Data, NotNil)
-	c.Assert(row.Data[5].GetMysqlBit(), Equals, mysql.Bit{Value: 6, Width: 8})
+	c.Assert(row.Data[5].GetMysqlBit(), Equals, types.Bit{Value: 6, Width: 8})
 	_, err = ts.se.Execute("drop table test.t")
 	c.Assert(err, IsNil)
 
@@ -199,11 +196,12 @@ func (ts *testSuite) TestUniqueIndexMultipleNullEntries(c *C) {
 	autoid, err := tb.AllocAutoID()
 	c.Assert(err, IsNil)
 	c.Assert(autoid, Greater, int64(0))
-
+	c.Assert(ctx.NewTxn(), IsNil)
 	_, err = tb.AddRecord(ctx, types.MakeDatums(1, nil))
 	c.Assert(err, IsNil)
 	_, err = tb.AddRecord(ctx, types.MakeDatums(2, nil))
 	c.Assert(err, IsNil)
+	c.Assert(ctx.Txn().Rollback(), IsNil)
 	_, err = ts.se.Execute("drop table test.t")
 	c.Assert(err, IsNil)
 }
@@ -257,13 +255,14 @@ func (ts *testSuite) TestUnsignedPK(c *C) {
 	dom := sessionctx.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tPK"))
 	c.Assert(err, IsNil)
-
+	c.Assert(ctx.NewTxn(), IsNil)
 	rid, err := tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
 	c.Assert(err, IsNil)
 	row, err := tb.Row(ctx, rid)
 	c.Assert(err, IsNil)
 	c.Assert(len(row), Equals, 2)
 	c.Assert(row[0].Kind(), Equals, types.KindUint64)
+	c.Assert(ctx.Txn().Commit(), IsNil)
 }
 
 func (ts *testSuite) TestIterRecords(c *C) {
@@ -273,6 +272,7 @@ func (ts *testSuite) TestIterRecords(c *C) {
 	_, err = ts.se.Execute("INSERT test.tIter VALUES (1, 2), (2, NULL)")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
+	c.Assert(ctx.NewTxn(), IsNil)
 	dom := sessionctx.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tIter"))
 	c.Assert(err, IsNil)
@@ -284,4 +284,5 @@ func (ts *testSuite) TestIterRecords(c *C) {
 	})
 	c.Assert(err, IsNil)
 	c.Assert(totalCount, Equals, 2)
+	c.Assert(ctx.Txn().Commit(), IsNil)
 }

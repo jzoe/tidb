@@ -15,76 +15,80 @@ package domain
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
+	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/perfschema"
+	"github.com/pingcap/tidb/plan/statscache"
+	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/terror"
 )
 
-var ddlLastReloadSchemaTS = "ddl_last_reload_schema_ts"
-
 // Domain represents a storage space. Different domains can use the same database name.
 // Multiple domains can be used in parallel without synchronization.
 type Domain struct {
-	store          kv.Storage
-	infoHandle     *infoschema.Handle
-	ddl            ddl.DDL
-	leaseCh        chan time.Duration
-	lastLeaseTS    int64 // nano seconds
-	m              sync.Mutex
-	SchemaValidity *schemaValidityInfo
+	store           kv.Storage
+	infoHandle      *infoschema.Handle
+	privHandle      *privileges.Handle
+	statsHandle     *statscache.Handle
+	ddl             ddl.DDL
+	m               sync.Mutex
+	SchemaValidator SchemaValidator
+	sysSessionPool  *sync.Pool
+	exit            chan struct{}
+
+	MockReloadFailed MockFailure // It mocks reload failed.
 }
 
 // loadInfoSchema loads infoschema at startTS into handle, usedSchemaVersion is the currently used
 // infoschema version, if it is the same as the schema version at startTS, we don't need to reload again.
-func (do *Domain) loadInfoSchema(handle *infoschema.Handle, usedSchemaVersion int64, startTS uint64) error {
+// It returns the latest schema version and an error.
+func (do *Domain) loadInfoSchema(handle *infoschema.Handle, usedSchemaVersion int64, startTS uint64) (int64, error) {
 	snapshot, err := do.store.GetSnapshot(kv.NewVersion(startTS))
 	if err != nil {
-		return errors.Trace(err)
+		return 0, errors.Trace(err)
 	}
 	m := meta.NewSnapshotMeta(snapshot)
 	latestSchemaVersion, err := m.GetSchemaVersion()
 	if err != nil {
-		return errors.Trace(err)
+		return 0, errors.Trace(err)
 	}
 	if usedSchemaVersion != 0 && usedSchemaVersion == latestSchemaVersion {
-		log.Debugf("[ddl] schema version is still %d, no need reload", usedSchemaVersion)
-		return nil
+		return latestSchemaVersion, nil
 	}
 	startTime := time.Now()
 	ok, err := do.tryLoadSchemaDiffs(m, usedSchemaVersion, latestSchemaVersion)
 	if err != nil {
 		// We can fall back to full load, don't need to return the error.
-		log.Errorf("[ddl] failed to load schema diff %v", err)
+		log.Errorf("[ddl] failed to load schema diff err %v", err)
 	}
 	if ok {
 		log.Infof("[ddl] diff load InfoSchema from version %d to %d, in %v",
 			usedSchemaVersion, latestSchemaVersion, time.Since(startTime))
-		return nil
+		return latestSchemaVersion, nil
 	}
 
 	schemas, err := do.fetchAllSchemasWithTables(m)
 	if err != nil {
-		return errors.Trace(err)
+		return 0, errors.Trace(err)
 	}
 
 	newISBuilder, err := infoschema.NewBuilder(handle).InitWithDBInfos(schemas, latestSchemaVersion)
 	if err != nil {
-		return errors.Trace(err)
+		return 0, errors.Trace(err)
 	}
 	log.Infof("[ddl] full load InfoSchema from version %d to %d, in %v",
 		usedSchemaVersion, latestSchemaVersion, time.Since(startTime))
 	newISBuilder.Build()
-	return nil
+	return latestSchemaVersion, nil
 }
 
 func (do *Domain) fetchAllSchemasWithTables(m *meta.Meta) ([]*model.DBInfo, error) {
@@ -189,15 +193,13 @@ func (do *Domain) tryLoadSchemaDiffs(m *meta.Meta, usedVersion, newVersion int64
 
 // InfoSchema gets information schema from domain.
 func (do *Domain) InfoSchema() infoschema.InfoSchema {
-	// try reload if possible.
-	do.tryReload()
 	return do.infoHandle.Get()
 }
 
 // GetSnapshotInfoSchema gets a snapshot information schema.
 func (do *Domain) GetSnapshotInfoSchema(snapshotTS uint64) (infoschema.InfoSchema, error) {
 	snapHandle := do.infoHandle.EmptyClone()
-	err := do.loadInfoSchema(snapHandle, do.infoHandle.Get().SchemaMetaVersion(), snapshotTS)
+	_, err := do.loadInfoSchema(snapHandle, do.infoHandle.Get().SchemaMetaVersion(), snapshotTS)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -219,156 +221,86 @@ func (do *Domain) Store() kv.Storage {
 	return do.store
 }
 
-// SetLease will reset the lease time for online DDL change.
-func (do *Domain) SetLease(lease time.Duration) {
-	if lease <= 0 {
-		log.Warnf("[ddl] set the current lease:%v into a new lease:%v failed, so do nothing",
-			do.ddl.GetLease(), lease)
-		return
-	}
-
-	if do.leaseCh == nil {
-		log.Errorf("[ddl] set the current lease:%v into a new lease:%v failed, so do nothing",
-			do.ddl.GetLease(), lease)
-		return
-	}
-
-	do.leaseCh <- lease
-	// let ddl to reset lease too.
-	do.ddl.SetLease(lease)
-}
-
-// Stats returns the domain statistic.
-func (do *Domain) Stats() (map[string]interface{}, error) {
-	m := make(map[string]interface{})
-	m[ddlLastReloadSchemaTS] = atomic.LoadInt64(&do.lastLeaseTS) / 1e9
-
-	return m, nil
-}
-
 // GetScope gets the status variables scope.
 func (do *Domain) GetScope(status string) variable.ScopeFlag {
 	// Now domain status variables scope are all default scope.
 	return variable.DefaultScopeFlag
 }
 
-func (do *Domain) tryReload() {
-	// If we don't have update the schema for a long time > lease, we must force reloading it.
-	// Although we try to reload schema every lease time in a goroutine, sometimes it may not run accurately.
-	// e.g., the machine has a very high load, running the ticker is delayed.
-	last := atomic.LoadInt64(&do.lastLeaseTS)
-	lease := do.ddl.GetLease()
-
-	// if lease is 0, we use the local store, so no need to reload.
-	if lease > 0 && time.Now().UnixNano()-last > lease.Nanoseconds() {
-		do.MustReload()
-	}
+func (do *Domain) mockReloadFailed() error {
+	return errors.New("mock reload failed")
 }
 
-var defaultMinReloadTimeout = 20 * time.Second
-
 // Reload reloads InfoSchema.
+// It's public in order to do the test.
 func (do *Domain) Reload() error {
 	// for test
-	if do.SchemaValidity.MockReloadFailed {
-		err := kv.RunInNewTxn(do.store, false, func(txn kv.Transaction) error {
-			do.SchemaValidity.setLastFailedTS(txn.StartTS())
-			return nil
-		})
-		if err != nil {
-			log.Errorf("mock reload failed err:%v", err)
-			return errors.Trace(err)
-		}
-		return errors.New("mock reload failed")
+	if do.MockReloadFailed.getValue() {
+		return do.mockReloadFailed()
 	}
 
-	// lock here for only once at same time.
+	// Lock here for only once at the same time.
 	do.m.Lock()
 	defer do.m.Unlock()
 
-	timeout := do.ddl.GetLease() / 2
-	if timeout < defaultMinReloadTimeout {
-		timeout = defaultMinReloadTimeout
-	}
+	startTime := time.Now()
 
-	exit := int32(0)
-	done := make(chan error, 1)
-	go func() {
-		var err error
-		for {
-			var ver kv.Version
-			ver, err = do.store.CurrentVersion()
-			if err == nil {
-				schemaVersion := int64(0)
-				oldInfoSchema := do.infoHandle.Get()
-				if oldInfoSchema != nil {
-					schemaVersion = oldInfoSchema.SchemaMetaVersion()
-				}
-				err = do.loadInfoSchema(do.infoHandle, schemaVersion, ver.Ver)
-			}
-			if err == nil {
-				atomic.StoreInt64(&do.lastLeaseTS, time.Now().UnixNano())
-				break
-			}
-			do.SchemaValidity.setLastFailedTS(ver.Ver)
-			log.Errorf("[ddl] load schema err %v, retry again", errors.ErrorStack(err))
-			if atomic.LoadInt32(&exit) == 1 {
-				return
-			}
-			// TODO: use a backoff algorithm.
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
+	var err error
+	var latestSchemaVersion int64
 
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		return errors.Trace(err)
-	case <-time.After(timeout):
-		atomic.StoreInt32(&exit, 1)
-		return ErrLoadSchemaTimeOut
-	}
-}
-
-// MustReload reloads the infoschema.
-// If reload error, it will hold whole program to guarantee data safe.
-// It's public in order to do the test.
-func (do *Domain) MustReload() error {
-	if err := do.Reload(); err != nil {
-		log.Errorf("[ddl] reload schema err %v, txnTS:%v", errors.ErrorStack(err),
-			do.SchemaValidity.getLastFailedTS())
-		do.SchemaValidity.SetValidity(false)
+	ver, err := do.store.CurrentVersion()
+	if err != nil {
 		return errors.Trace(err)
 	}
-	do.SchemaValidity.SetValidity(true)
+
+	schemaVersion := int64(0)
+	oldInfoSchema := do.infoHandle.Get()
+	if oldInfoSchema != nil {
+		schemaVersion = oldInfoSchema.SchemaMetaVersion()
+	}
+
+	latestSchemaVersion, err = do.loadInfoSchema(do.infoHandle, schemaVersion, ver.Ver)
+	loadSchemaDuration.Observe(time.Since(startTime).Seconds())
+	if err != nil {
+		loadSchemaCounter.WithLabelValues("failed").Inc()
+		return errors.Trace(err)
+	}
+	loadSchemaCounter.WithLabelValues("succ").Inc()
+
+	do.SchemaValidator.Update(ver.Ver, latestSchemaVersion)
+
+	lease := do.DDL().GetLease()
+	sub := time.Since(startTime)
+	if sub > lease && lease > 0 {
+		log.Warnf("[ddl] loading schema takes a long time %v", sub)
+	}
+
 	return nil
 }
 
 func (do *Domain) loadSchemaInLoop(lease time.Duration) {
-	ticker := time.NewTicker(lease)
+	// Lease renewal can run at any frequency.
+	// Use lease/2 here as recommend by paper.
+	ticker := time.NewTicker(lease / 2)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			err := do.MustReload()
+			err := do.Reload()
 			if err != nil {
 				log.Errorf("[ddl] reload schema in loop err %v", errors.ErrorStack(err))
 			}
-		case newLease := <-do.leaseCh:
-			if lease == newLease {
-				// nothing to do
-				continue
-			}
-
-			lease = newLease
-			// reset ticker too.
-			ticker.Stop()
-			ticker = time.NewTicker(lease)
+		case <-do.exit:
+			return
 		}
 	}
+}
+
+// Close closes the Domain and release its resource.
+func (do *Domain) Close() {
+	do.ddl.Stop()
+	close(do.exit)
 }
 
 type ddlCallback struct {
@@ -380,87 +312,152 @@ func (c *ddlCallback) OnChanged(err error) error {
 	if err != nil {
 		return err
 	}
-	log.Infof("[ddl] on DDL change")
+	log.Infof("[ddl] on DDL change, must reload")
 
-	return c.do.MustReload()
-}
-
-type schemaValidityInfo struct {
-	isValid          bool
-	lastInvalidTS    uint64 // It's used for recording the last txn TS of schema invalid.
-	mux              sync.RWMutex
-	lastFailedTS     uint64 // It's used for recording the last txn TS of loading schema failed.
-	MockReloadFailed bool   // It mocks reload failed.
-}
-
-func (s *schemaValidityInfo) setLastFailedTS(ts uint64) {
-	atomic.StoreUint64(&s.lastFailedTS, ts)
-}
-
-func (s *schemaValidityInfo) getLastFailedTS() uint64 {
-	return atomic.LoadUint64(&s.lastFailedTS)
-}
-
-// SetValidity sets the schema validity value.
-// It's public in order to do the test.
-func (s *schemaValidityInfo) SetValidity(v bool) {
-	s.mux.Lock()
-	if !v {
-		txnTS := s.getLastFailedTS()
-		log.Errorf("[ddl] SetValidity, v:%v txnTS:%v lastInvalidTS:%v", v, txnTS, s.lastInvalidTS)
-		if s.lastInvalidTS < txnTS {
-			s.lastInvalidTS = txnTS
-		}
+	err = c.do.Reload()
+	if err != nil {
+		log.Errorf("[ddl] on DDL change reload err %v", err)
 	}
-	if s.isValid != v {
-		log.Infof("[ddl] SetValidity, original:%v current:%v", s.isValid, v)
-		s.isValid = v
-	}
-	s.mux.Unlock()
+
+	return nil
 }
 
-func (s *schemaValidityInfo) Check(lastFailedTS uint64) error {
-	s.mux.RLock()
-	if s.isValid && (lastFailedTS == 0 || lastFailedTS > s.lastInvalidTS) {
-		s.mux.RUnlock()
-		return nil
-	}
-	s.mux.RUnlock()
-	return ErrLoadSchemaTimeOut.Gen("InfomationSchema is out of date.")
+// MockFailure mocks reload failed.
+// It's used for fixing data race in tests.
+type MockFailure struct {
+	sync.RWMutex
+	val bool // val is true means we need to mock reload failed.
+}
+
+// SetValue sets whether we need to mock reload failed.
+func (m *MockFailure) SetValue(isFailed bool) {
+	m.Lock()
+	defer m.Unlock()
+	m.val = isFailed
+}
+
+func (m *MockFailure) getValue() bool {
+	m.RLock()
+	defer m.RUnlock()
+	return m.val
 }
 
 // NewDomain creates a new domain. Should not create multiple domains for the same store.
 func NewDomain(store kv.Storage, lease time.Duration) (d *Domain, err error) {
-	d = &Domain{store: store,
-		SchemaValidity: &schemaValidityInfo{}}
+	d = &Domain{
+		store:           store,
+		SchemaValidator: newSchemaValidator(lease),
+		exit:            make(chan struct{}),
+		sysSessionPool:  &sync.Pool{},
+	}
 
 	d.infoHandle, err = infoschema.NewHandle(d.store)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	d.ddl = ddl.NewDDL(d.store, d.infoHandle, &ddlCallback{do: d}, lease)
-	if err = d.MustReload(); err != nil {
+	if err = d.Reload(); err != nil {
 		return nil, errors.Trace(err)
 	}
-
-	variable.RegisterStatistics(d)
 
 	// Only when the store is local that the lease value is 0.
 	// If the store is local, it doesn't need loadSchemaInLoop.
 	if lease > 0 {
-		d.leaseCh = make(chan time.Duration, 1)
+		// Local store needs to get the change information for every DDL state in each session.
 		go d.loadSchemaInLoop(lease)
 	}
 
 	return d, nil
 }
 
+// SysSessionPool returns the system session pool.
+func (do *Domain) SysSessionPool() *sync.Pool {
+	return do.sysSessionPool
+}
+
+// LoadPrivilegeLoop create a goroutine loads privilege tables in a loop, it
+// should be called only once in BootstrapSession.
+func (do *Domain) LoadPrivilegeLoop(ctx context.Context) error {
+	do.privHandle = privileges.NewHandle(ctx)
+	err := do.privHandle.Update()
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	go func(do *Domain) {
+		ticker := time.NewTicker(5 * time.Minute)
+		for {
+			select {
+			case <-ticker.C:
+				err := do.privHandle.Update()
+				if err != nil {
+					log.Error(errors.ErrorStack(err))
+				}
+			case <-do.exit:
+				return
+			}
+		}
+	}(do)
+
+	return nil
+}
+
+// PrivilegeHandle returns the MySQLPrivilege.
+func (do *Domain) PrivilegeHandle() *privileges.Handle {
+	return do.privHandle
+}
+
+func (do *Domain) loadTableStats() error {
+	ver, err := do.store.CurrentVersion()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	snapshot, err := do.store.GetSnapshot(kv.NewVersion(ver.Ver))
+	if err != nil {
+		return errors.Trace(err)
+	}
+	m := meta.NewSnapshotMeta(snapshot)
+	err = do.statsHandle.Update(m, do.InfoSchema())
+	return errors.Trace(err)
+}
+
+// LoadTableStatsLoop creates a goroutine loads stats info in a loop, it
+// should be called only once in BootstrapSession.
+func (do *Domain) LoadTableStatsLoop(ctx context.Context) error {
+	do.statsHandle = statscache.NewHandle(ctx)
+	err := do.loadTableStats()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	lease := do.DDL().GetLease()
+	if lease > 0 {
+		go func(do *Domain) {
+			ticker := time.NewTicker(lease)
+			for {
+				select {
+				case <-ticker.C:
+					err := do.loadTableStats()
+					if err != nil {
+						log.Error(errors.ErrorStack(err))
+					}
+				case <-do.exit:
+					return
+				}
+			}
+		}(do)
+	}
+	return nil
+}
+
 // Domain error codes.
 const (
-	codeLoadSchemaTimeOut terror.ErrCode = 1
+	codeInfoSchemaExpired terror.ErrCode = 1
+	codeInfoSchemaChanged terror.ErrCode = 2
 )
 
 var (
-	// ErrLoadSchemaTimeOut returns for loading schema time out.
-	ErrLoadSchemaTimeOut = terror.ClassDomain.New(codeLoadSchemaTimeOut, "reload schema timeout")
+	// ErrInfoSchemaExpired returns the error that information schema is out of date.
+	ErrInfoSchemaExpired = terror.ClassDomain.New(codeInfoSchemaExpired, "Information schema is out of date.")
+	// ErrInfoSchemaChanged returns the error that information schema is changed.
+	ErrInfoSchemaChanged = terror.ClassDomain.New(codeInfoSchemaChanged, "Information schema is changed.")
 )

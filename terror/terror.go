@@ -24,13 +24,9 @@ import (
 	"github.com/pingcap/tidb/mysql"
 )
 
-// Common base error instances.
+// Global error instances.
 var (
-	CommitNotInTransaction   = ClassExecutor.New(CodeCommitNotInTransaction, "commit not in transaction")
-	RollbackNotInTransaction = ClassExecutor.New(CodeRollbackNotInTransaction, "rollback not in transaction")
-	ExecResultIsEmpty        = ClassExecutor.New(CodeExecResultIsEmpty, "exec result is empty")
-
-	MissConnectionID = ClassExpression.New(CodeMissConnectionID, "miss connection id information")
+	ErrCritical = ClassGlobal.New(CodeExecResultIsEmpty, "critical error %v")
 )
 
 // ErrCode represents a specific error type in a error class.
@@ -39,10 +35,8 @@ type ErrCode int
 
 // Executor error codes.
 const (
-	CodeUnknown                  ErrCode = -1
-	CodeCommitNotInTransaction           = 1
-	CodeRollbackNotInTransaction         = 2
-	CodeExecResultIsEmpty                = 3
+	CodeUnknown           ErrCode = -1
+	CodeExecResultIsEmpty         = 3
 )
 
 // Expression error codes.
@@ -76,6 +70,7 @@ const (
 	ClassXEval
 	ClassTable
 	ClassTypes
+	ClassGlobal
 	// Add more as needed.
 )
 
@@ -118,6 +113,8 @@ func (ec ErrClass) String() string {
 		return "table"
 	case ClassTypes:
 		return "types"
+	case ClassGlobal:
+		return "global"
 	}
 	return strconv.Itoa(int(ec))
 }
@@ -223,6 +220,14 @@ func (e *Error) getMsg() string {
 func (e *Error) Gen(format string, args ...interface{}) *Error {
 	err := *e
 	err.message = format
+	err.args = args
+	_, err.file, err.line, _ = runtime.Caller(1)
+	return &err
+}
+
+// GenByArgs generates a new *Error with the same class and code, and new arguments.
+func (e *Error) GenByArgs(args ...interface{}) *Error {
+	err := *e
 	err.args = args
 	_, err.file, err.line, _ = runtime.Caller(1)
 	return &err

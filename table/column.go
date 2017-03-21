@@ -19,14 +19,14 @@ package table
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -114,13 +114,28 @@ func CastValues(ctx context.Context, rec []types.Datum, cols []*Column, ignoreEr
 
 // CastValue casts a value based on column type.
 func CastValue(ctx context.Context, val types.Datum, col *model.ColumnInfo) (casted types.Datum, err error) {
-	casted, err = val.ConvertTo(&col.FieldType)
+	sc := ctx.GetSessionVars().StmtCtx
+	casted, err = val.ConvertTo(sc, &col.FieldType)
+	// TODO: make sure all truncate errors are handled by ConvertTo.
+	err = sc.HandleTruncate(err)
 	if err != nil {
-		if variable.GetSessionVars(ctx).StrictSQLMode {
-			return casted, errors.Trace(err)
+		return casted, errors.Trace(err)
+	}
+	if !mysql.IsUTF8Charset(col.Charset) {
+		return casted, nil
+	}
+	str := casted.GetString()
+	for _, r := range str {
+		if r == utf8.RuneError {
+			// Truncate to valid utf8 string.
+			// casted = types.NewStringDatum(str[:i])
+			err = sc.HandleTruncate(ErrTruncateWrongValue)
+			break
 		}
-		// TODO: add warnings.
-		log.Warnf("cast value error %v", err)
+	}
+	if err != nil {
+		// TODO: enable it when find a better way to handle old incorrect data.
+		log.Debugf("invalid UTF8 value %v for column %s", str, col.Name.O)
 	}
 	return casted, nil
 }
@@ -240,45 +255,56 @@ func CheckNotNull(cols []*Column, row []types.Datum) error {
 	return nil
 }
 
+// GetColOriginDefaultValue gets default value of the column from original default value.
+func GetColOriginDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum, error) {
+	return getColDefaultValue(ctx, col, col.OriginDefaultValue)
+}
+
 // GetColDefaultValue gets default value of the column.
-func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum, bool, error) {
-	// Check no default value flag.
-	if mysql.HasNoDefaultValueFlag(col.Flag) && col.Tp != mysql.TypeEnum {
-		err := errNoDefaultValue.Gen("Field '%s' doesn't have a default value", col.Name)
-		if ctx != nil {
-			sessVars := variable.GetSessionVars(ctx)
-			if !sessVars.StrictSQLMode {
-				// TODO: add warning.
-				return GetZeroValue(col), true, nil
-			}
-		}
-		return types.Datum{}, false, errors.Trace(err)
+func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum, error) {
+	return getColDefaultValue(ctx, col, col.DefaultValue)
+}
+
+func getColDefaultValue(ctx context.Context, col *model.ColumnInfo, defaultVal interface{}) (types.Datum, error) {
+	if defaultVal == nil {
+		return getColDefaultValueFromNil(ctx, col)
 	}
 
 	// Check and get timestamp/datetime default value.
 	if col.Tp == mysql.TypeTimestamp || col.Tp == mysql.TypeDatetime {
-		if col.DefaultValue == nil {
-			return types.Datum{}, true, nil
-		}
-
-		value, err := evaluator.GetTimeValue(ctx, col.DefaultValue, col.Tp, col.Decimal)
+		value, err := expression.GetTimeValue(ctx, defaultVal, col.Tp, col.Decimal)
 		if err != nil {
-			return types.Datum{}, true, errGetDefaultFailed.Gen("Field '%s' get default value fail - %s",
+			return types.Datum{}, errGetDefaultFailed.Gen("Field '%s' get default value fail - %s",
 				col.Name, errors.Trace(err))
 		}
-		return value, true, nil
-	} else if col.Tp == mysql.TypeEnum {
+		return value, nil
+	}
+	value, err := CastValue(ctx, types.NewDatum(defaultVal), col)
+	if err != nil {
+		return types.Datum{}, errors.Trace(err)
+	}
+	return value, nil
+}
+
+func getColDefaultValueFromNil(ctx context.Context, col *model.ColumnInfo) (types.Datum, error) {
+	if !mysql.HasNotNullFlag(col.Flag) {
+		return types.Datum{}, nil
+	}
+	if col.Tp == mysql.TypeEnum {
 		// For enum type, if no default value and not null is set,
 		// the default value is the first element of the enum list
-		if col.DefaultValue == nil && mysql.HasNotNullFlag(col.Flag) {
-			return types.NewDatum(col.FieldType.Elems[0]), true, nil
-		}
+		return types.NewDatum(col.FieldType.Elems[0]), nil
 	}
-	value, err := CastValue(ctx, types.NewDatum(col.DefaultValue), col)
-	if err != nil {
-		return types.Datum{}, false, errors.Trace(err)
+	if mysql.HasAutoIncrementFlag(col.Flag) {
+		// Auto increment column doesn't has default value and we should not return error.
+		return types.Datum{}, nil
 	}
-	return value, true, nil
+	if !ctx.GetSessionVars().StrictSQLMode {
+		// Non strict mode use zero value.
+		// TODO: add warning.
+		return GetZeroValue(col), nil
+	}
+	return types.Datum{}, errNoDefaultValue.Gen("Field '%s' doesn't have a default value", col.Name)
 }
 
 // GetZeroValue gets zero value for given column type.
@@ -296,23 +322,23 @@ func GetZeroValue(col *model.ColumnInfo) types.Datum {
 	case mysql.TypeDouble:
 		d.SetFloat64(0)
 	case mysql.TypeNewDecimal:
-		d.SetMysqlDecimal(new(mysql.MyDecimal))
+		d.SetMysqlDecimal(new(types.MyDecimal))
 	case mysql.TypeString, mysql.TypeVarString, mysql.TypeVarchar:
 		d.SetString("")
 	case mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
 		d.SetBytes([]byte{})
 	case mysql.TypeDuration:
-		d.SetMysqlDuration(mysql.ZeroDuration)
+		d.SetMysqlDuration(types.ZeroDuration)
 	case mysql.TypeDate, mysql.TypeNewDate:
-		d.SetMysqlTime(mysql.ZeroDate)
+		d.SetMysqlTime(types.ZeroDate)
 	case mysql.TypeTimestamp:
-		d.SetMysqlTime(mysql.ZeroTimestamp)
+		d.SetMysqlTime(types.ZeroTimestamp)
 	case mysql.TypeDatetime:
-		d.SetMysqlTime(mysql.ZeroDatetime)
+		d.SetMysqlTime(types.ZeroDatetime)
 	case mysql.TypeBit:
-		d.SetMysqlBit(mysql.Bit{Value: 0, Width: mysql.MinBitWidth})
+		d.SetMysqlBit(types.Bit{Value: 0, Width: types.MinBitWidth})
 	case mysql.TypeSet:
-		d.SetMysqlSet(mysql.Set{})
+		d.SetMysqlSet(types.Set{})
 	}
 	return d
 }

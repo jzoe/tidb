@@ -40,6 +40,8 @@ const (
 	ActionDropForeignKey
 	ActionTruncateTable
 	ActionModifyColumn
+	ActionRenameTable
+	ActionSetDefaultValue
 )
 
 func (action ActionType) String() string {
@@ -68,9 +70,34 @@ func (action ActionType) String() string {
 		return "truncate table"
 	case ActionModifyColumn:
 		return "modify column"
+	case ActionRenameTable:
+		return "rename table"
+	case ActionSetDefaultValue:
+		return "set default value"
 	default:
 		return "none"
 	}
+}
+
+// HistoryInfo is used for binlog.
+type HistoryInfo struct {
+	SchemaVersion int64
+	DBInfo        *DBInfo
+	TableInfo     *TableInfo
+}
+
+// AddDBInfo adds schema version and schema information that are used for binlog.
+// dbInfo is added in the following operations: create database, drop database.
+func (h *HistoryInfo) AddDBInfo(schemaVer int64, dbInfo *DBInfo) {
+	h.SchemaVersion = schemaVer
+	h.DBInfo = dbInfo
+}
+
+// AddTableInfo adds schema version and table information that are used for binlog.
+// tblInfo is added except for the following operations: create database, drop database.
+func (h *HistoryInfo) AddTableInfo(schemaVer int64, tblInfo *TableInfo) {
+	h.SchemaVersion = schemaVer
+	h.TableInfo = tblInfo
 }
 
 // Job is for a DDL operation.
@@ -96,7 +123,8 @@ type Job struct {
 	// TODO: Use timestamp allocated by TSO.
 	LastUpdateTS int64 `json:"last_update_ts"`
 	// Query string of the ddl job.
-	Query string `json:"query"`
+	Query      string       `json:"query"`
+	BinlogInfo *HistoryInfo `json:"binlog"`
 }
 
 // SetRowCount sets the number of rows. Make sure it can pass `make race`.
@@ -148,8 +176,8 @@ func (job *Job) DecodeArgs(args ...interface{}) error {
 // String implements fmt.Stringer interface.
 func (job *Job) String() string {
 	rowCount := job.GetRowCount()
-	return fmt.Sprintf("ID:%d, Type:%s, State:%s, SchemaState:%s, SchemaID:%d, TableID:%d, RowCount:%d, ArgLen:%d, Query:\n%s",
-		job.ID, job.Type, job.State, job.SchemaState, job.SchemaID, job.TableID, rowCount, len(job.Args), job.Query)
+	return fmt.Sprintf("ID:%d, Type:%s, State:%s, SchemaState:%s, SchemaID:%d, TableID:%d, RowCount:%d, ArgLen:%d",
+		job.ID, job.Type, job.State, job.SchemaState, job.SchemaID, job.TableID, rowCount, len(job.Args))
 }
 
 // IsFinished returns whether job is finished or not.
@@ -225,4 +253,6 @@ type SchemaDiff struct {
 
 	// OldTableID is the table ID before truncate, only used by truncate table DDL.
 	OldTableID int64 `json:"old_table_id"`
+	// OldSchemaID is the schema ID before rename table, only used by rename table DDL.
+	OldSchemaID int64 `json:"old_schema_id"`
 }

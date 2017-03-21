@@ -25,7 +25,6 @@ import (
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/util/charset"
-	"github.com/pingcap/tidb/util/distinct"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -67,10 +66,10 @@ type AggregationFunction interface {
 	IsDistinct() bool
 
 	// SetContext sets the aggregate evaluation context.
-	SetContext(ctx map[string](*ast.AggEvaluateContext))
+	SetContext(ctx map[string](*aggEvaluateContext))
 
 	// Equal checks whether two aggregation functions are equal.
-	Equal(agg AggregationFunction) bool
+	Equal(agg AggregationFunction, ctx context.Context) bool
 
 	// Clone copies an aggregate function totally.
 	Clone() AggregationFunction
@@ -81,7 +80,16 @@ type AggregationFunction interface {
 	// CalculateDefaultValue gets the default value when the aggregate function's input is null.
 	// The input stands for the schema of Aggregation's child. If the function can't produce a default value, the second
 	// return value will be false.
-	CalculateDefaultValue(schema Schema) (types.Datum, bool)
+	CalculateDefaultValue(schema *Schema, ctx context.Context) (types.Datum, bool)
+}
+
+// aggEvaluateContext is used to store intermediate result when calculating aggregate functions.
+type aggEvaluateContext struct {
+	DistinctChecker *distinctChecker
+	Count           int64
+	Value           types.Datum
+	Buffer          *bytes.Buffer // Buffer is used for group_concat.
+	GotFirstRow     bool          // It will check if the agg has met the first row key.
 }
 
 // NewAggFunction creates a new AggregationFunction.
@@ -105,7 +113,7 @@ func NewAggFunction(funcType string, funcArgs []Expression, distinct bool) Aggre
 	return nil
 }
 
-type aggCtxMapper map[string]*ast.AggEvaluateContext
+type aggCtxMapper map[string]*aggEvaluateContext
 
 // AggFunctionMode stands for the aggregation function's mode.
 type AggFunctionMode int
@@ -123,11 +131,11 @@ type aggFunction struct {
 	Args         []Expression
 	Distinct     bool
 	resultMapper aggCtxMapper
-	streamCtx    *ast.AggEvaluateContext
+	streamCtx    *aggEvaluateContext
 }
 
 // Equal implements AggregationFunction interface.
-func (af *aggFunction) Equal(b AggregationFunction) bool {
+func (af *aggFunction) Equal(b AggregationFunction, ctx context.Context) bool {
 	if af.GetName() != b.GetName() {
 		return false
 	}
@@ -136,7 +144,7 @@ func (af *aggFunction) Equal(b AggregationFunction) bool {
 	}
 	if len(af.GetArgs()) == len(b.GetArgs()) {
 		for i, argA := range af.GetArgs() {
-			if !argA.Equal(b.GetArgs()[i]) {
+			if !argA.Equal(b.GetArgs()[i], ctx) {
 				return false
 			}
 		}
@@ -168,11 +176,12 @@ func newAggFunc(name string, args []Expression, dist bool) aggFunction {
 		name:         name,
 		Args:         args,
 		resultMapper: make(aggCtxMapper, 0),
-		Distinct:     dist}
+		Distinct:     dist,
+	}
 }
 
 // CalculateDefaultValue implements AggregationFunction interface.
-func (af *aggFunction) CalculateDefaultValue(schema Schema) (types.Datum, bool) {
+func (af *aggFunction) CalculateDefaultValue(schema *Schema, ctx context.Context) (types.Datum, bool) {
 	return types.Datum{}, false
 }
 
@@ -212,37 +221,37 @@ func (af *aggFunction) SetArgs(args []Expression) {
 	af.Args = args
 }
 
-func (af *aggFunction) getContext(groupKey []byte) *ast.AggEvaluateContext {
+func (af *aggFunction) getContext(groupKey []byte) *aggEvaluateContext {
 	ctx, ok := af.resultMapper[string(groupKey)]
 	if !ok {
-		ctx = &ast.AggEvaluateContext{}
+		ctx = &aggEvaluateContext{}
 		if af.Distinct {
-			ctx.DistinctChecker = distinct.CreateDistinctChecker()
+			ctx.DistinctChecker = createDistinctChecker()
 		}
 		af.resultMapper[string(groupKey)] = ctx
 	}
 	return ctx
 }
 
-func (af *aggFunction) getStreamedContext() *ast.AggEvaluateContext {
+func (af *aggFunction) getStreamedContext() *aggEvaluateContext {
 	if af.streamCtx == nil {
-		af.streamCtx = &ast.AggEvaluateContext{}
+		af.streamCtx = &aggEvaluateContext{}
 		if af.Distinct {
-			af.streamCtx.DistinctChecker = distinct.CreateDistinctChecker()
+			af.streamCtx.DistinctChecker = createDistinctChecker()
 		}
 	}
 	return af.streamCtx
 }
 
 // SetContext implements AggregationFunction interface.
-func (af *aggFunction) SetContext(ctx map[string](*ast.AggEvaluateContext)) {
+func (af *aggFunction) SetContext(ctx map[string](*aggEvaluateContext)) {
 	af.resultMapper = ctx
 }
 
 func (af *aggFunction) updateSum(row []types.Datum, groupKey []byte, ectx context.Context) error {
 	ctx := af.getContext(groupKey)
 	a := af.Args[0]
-	value, err := a.Eval(row, ectx)
+	value, err := a.Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -258,7 +267,7 @@ func (af *aggFunction) updateSum(row []types.Datum, groupKey []byte, ectx contex
 			return nil
 		}
 	}
-	ctx.Value, err = types.CalculateSum(ctx.Value, value)
+	ctx.Value, err = calculateSum(ectx.GetSessionVars().StmtCtx, ctx.Value, value)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -269,7 +278,7 @@ func (af *aggFunction) updateSum(row []types.Datum, groupKey []byte, ectx contex
 func (af *aggFunction) streamUpdateSum(row []types.Datum, ectx context.Context) error {
 	ctx := af.getStreamedContext()
 	a := af.Args[0]
-	value, err := a.Eval(row, ectx)
+	value, err := a.Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -285,7 +294,7 @@ func (af *aggFunction) streamUpdateSum(row []types.Datum, ectx context.Context) 
 			return nil
 		}
 	}
-	ctx.Value, err = types.CalculateSum(ctx.Value, value)
+	ctx.Value, err = calculateSum(ectx.GetSessionVars().StmtCtx, ctx.Value, value)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -333,15 +342,15 @@ func (sf *sumFunction) GetStreamResult() (d types.Datum) {
 }
 
 // CalculateDefaultValue implements AggregationFunction interface.
-func (sf *sumFunction) CalculateDefaultValue(schema Schema) (d types.Datum, valid bool) {
+func (sf *sumFunction) CalculateDefaultValue(schema *Schema, ctx context.Context) (d types.Datum, valid bool) {
 	arg := sf.Args[0]
-	result, err := EvaluateExprWithNull(schema, arg)
+	result, err := EvaluateExprWithNull(ctx, schema, arg)
 	if err != nil {
 		log.Warnf("Evaluate expr with null failed in function %s, err msg is %s", sf, err.Error())
 		return d, false
 	}
 	if con, ok := result.(*Constant); ok {
-		d, err = types.CalculateSum(d, con.Value)
+		d, err = calculateSum(ctx.GetSessionVars().StmtCtx, d, con.Value)
 		if err != nil {
 			log.Warnf("CalculateSum failed in function %s, err msg is %s", sf, err.Error())
 		}
@@ -374,9 +383,9 @@ func (cf *countFunction) Clone() AggregationFunction {
 }
 
 // CalculateDefaultValue implements AggregationFunction interface.
-func (cf *countFunction) CalculateDefaultValue(schema Schema) (d types.Datum, valid bool) {
+func (cf *countFunction) CalculateDefaultValue(schema *Schema, ctx context.Context) (d types.Datum, valid bool) {
 	for _, arg := range cf.Args {
-		result, err := EvaluateExprWithNull(schema, arg)
+		result, err := EvaluateExprWithNull(ctx, schema, arg)
 		if err != nil {
 			log.Warnf("Evaluate expr with null failed in function %s, err msg is %s", cf, err.Error())
 			return d, false
@@ -409,7 +418,7 @@ func (cf *countFunction) Update(row []types.Datum, groupKey []byte, ectx context
 		vals = make([]interface{}, 0, len(cf.Args))
 	}
 	for _, a := range cf.Args {
-		value, err := a.Eval(row, ectx)
+		value, err := a.Eval(row)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -446,7 +455,7 @@ func (cf *countFunction) StreamUpdate(row []types.Datum, ectx context.Context) e
 		vals = make([]interface{}, 0, len(cf.Args))
 	}
 	for _, a := range cf.Args {
-		value, err := a.Eval(row, ectx)
+		value, err := a.Eval(row)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -512,7 +521,7 @@ func (af *avgFunction) GetType() *types.FieldType {
 func (af *avgFunction) updateAvg(row []types.Datum, groupKey []byte, ectx context.Context) error {
 	ctx := af.getContext(groupKey)
 	a := af.Args[1]
-	value, err := a.Eval(row, ectx)
+	value, err := a.Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -528,11 +537,11 @@ func (af *avgFunction) updateAvg(row []types.Datum, groupKey []byte, ectx contex
 			return nil
 		}
 	}
-	ctx.Value, err = types.CalculateSum(ctx.Value, value)
+	ctx.Value, err = calculateSum(ectx.GetSessionVars().StmtCtx, ctx.Value, value)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	count, err := af.Args[0].Eval(row, ectx)
+	count, err := af.Args[0].Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -553,17 +562,17 @@ func (af *avgFunction) StreamUpdate(row []types.Datum, ctx context.Context) erro
 	return af.streamUpdateSum(row, ctx)
 }
 
-func (af *avgFunction) calculateResult(ctx *ast.AggEvaluateContext) (d types.Datum) {
+func (af *avgFunction) calculateResult(ctx *aggEvaluateContext) (d types.Datum) {
 	switch ctx.Value.Kind() {
 	case types.KindFloat64:
 		t := ctx.Value.GetFloat64() / float64(ctx.Count)
 		d.SetValue(t)
 	case types.KindMysqlDecimal:
 		x := ctx.Value.GetMysqlDecimal()
-		y := mysql.NewDecFromInt(ctx.Count)
-		to := new(mysql.MyDecimal)
-		mysql.DecimalDiv(x, y, to, mysql.DivFracIncr)
-		to.Round(to, ctx.Value.Frac()+mysql.DivFracIncr)
+		y := types.NewDecFromInt(ctx.Count)
+		to := new(types.MyDecimal)
+		types.DecimalDiv(x, y, to, types.DivFracIncr)
+		to.Round(to, ctx.Value.Frac()+types.DivFracIncr)
 		d.SetMysqlDecimal(to)
 	}
 	return
@@ -609,7 +618,7 @@ func (cf *concatFunction) Update(row []types.Datum, groupKey []byte, ectx contex
 	ctx := cf.getContext(groupKey)
 	vals := make([]interface{}, 0, len(cf.Args))
 	for _, a := range cf.Args {
-		value, err := a.Eval(row, ectx)
+		value, err := a.Eval(row)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -645,7 +654,7 @@ func (cf *concatFunction) StreamUpdate(row []types.Datum, ectx context.Context) 
 	ctx := cf.getStreamedContext()
 	vals := make([]interface{}, 0, len(cf.Args))
 	for _, a := range cf.Args {
-		value, err := a.Eval(row, ectx)
+		value, err := a.Eval(row)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -717,9 +726,9 @@ func (mmf *maxMinFunction) Clone() AggregationFunction {
 }
 
 // CalculateDefaultValue implements AggregationFunction interface.
-func (mmf *maxMinFunction) CalculateDefaultValue(schema Schema) (d types.Datum, valid bool) {
+func (mmf *maxMinFunction) CalculateDefaultValue(schema *Schema, ctx context.Context) (d types.Datum, valid bool) {
 	arg := mmf.Args[0]
-	result, err := EvaluateExprWithNull(schema, arg)
+	result, err := EvaluateExprWithNull(ctx, schema, arg)
 	if err != nil {
 		log.Warnf("Evaluate expr with null failed in function %s, err msg is %s", mmf, err.Error())
 		return d, false
@@ -757,7 +766,7 @@ func (mmf *maxMinFunction) Update(row []types.Datum, groupKey []byte, ectx conte
 		return errors.New("Wrong number of args for AggFuncMaxMin")
 	}
 	a := mmf.Args[0]
-	value, err := a.Eval(row, ectx)
+	value, err := a.Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -768,7 +777,7 @@ func (mmf *maxMinFunction) Update(row []types.Datum, groupKey []byte, ectx conte
 		return nil
 	}
 	var c int
-	c, err = ctx.Value.CompareDatum(value)
+	c, err = ctx.Value.CompareDatum(ectx.GetSessionVars().StmtCtx, value)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -785,7 +794,7 @@ func (mmf *maxMinFunction) StreamUpdate(row []types.Datum, ectx context.Context)
 		return errors.New("Wrong number of args for AggFuncMaxMin")
 	}
 	a := mmf.Args[0]
-	value, err := a.Eval(row, ectx)
+	value, err := a.Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -796,7 +805,7 @@ func (mmf *maxMinFunction) StreamUpdate(row []types.Datum, ectx context.Context)
 		return nil
 	}
 	var c int
-	c, err = ctx.Value.CompareDatum(value)
+	c, err = ctx.Value.CompareDatum(ectx.GetSessionVars().StmtCtx, value)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -828,34 +837,36 @@ func (ff *firstRowFunction) GetType() *types.FieldType {
 // Update implements AggregationFunction interface.
 func (ff *firstRowFunction) Update(row []types.Datum, groupKey []byte, ectx context.Context) error {
 	ctx := ff.getContext(groupKey)
-	if !ctx.Value.IsNull() {
+	if ctx.GotFirstRow {
 		return nil
 	}
 	if len(ff.Args) != 1 {
 		return errors.New("Wrong number of args for AggFuncFirstRow")
 	}
-	value, err := ff.Args[0].Eval(row, ectx)
+	value, err := ff.Args[0].Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	ctx.Value = value
+	ctx.GotFirstRow = true
 	return nil
 }
 
 // StreamUpdate implements AggregationFunction interface.
 func (ff *firstRowFunction) StreamUpdate(row []types.Datum, ectx context.Context) error {
 	ctx := ff.getStreamedContext()
-	if !ctx.Value.IsNull() {
+	if ctx.GotFirstRow {
 		return nil
 	}
 	if len(ff.Args) != 1 {
 		return errors.New("Wrong number of args for AggFuncFirstRow")
 	}
-	value, err := ff.Args[0].Eval(row, ectx)
+	value, err := ff.Args[0].Eval(row)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	ctx.Value = value
+	ctx.GotFirstRow = true
 	return nil
 }
 
@@ -875,9 +886,9 @@ func (ff *firstRowFunction) GetStreamResult() (d types.Datum) {
 }
 
 // CalculateDefaultValue implements AggregationFunction interface.
-func (ff *firstRowFunction) CalculateDefaultValue(schema Schema) (d types.Datum, valid bool) {
+func (ff *firstRowFunction) CalculateDefaultValue(schema *Schema, ctx context.Context) (d types.Datum, valid bool) {
 	arg := ff.Args[0]
-	result, err := EvaluateExprWithNull(schema, arg)
+	result, err := EvaluateExprWithNull(ctx, schema, arg)
 	if err != nil {
 		log.Warnf("Evaluate expr with null failed in function %s, err msg is %s", ff, err.Error())
 		return d, false

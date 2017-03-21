@@ -18,9 +18,11 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -29,8 +31,8 @@ var fullRange = []rangePoint{
 	{value: types.MaxValueDatum()},
 }
 
-func buildIndexRange(p *PhysicalIndexScan) error {
-	rb := rangeBuilder{}
+func buildIndexRange(sc *variable.StatementContext, p *PhysicalIndexScan) error {
+	rb := rangeBuilder{sc: sc}
 	for i := 0; i < p.accessInAndEqCount; i++ {
 		// Build ranges for equal or in access conditions.
 		point := rb.build(p.AccessCondition[i])
@@ -61,6 +63,23 @@ func buildIndexRange(p *PhysicalIndexScan) error {
 	if p.Index.HasPrefixIndex() {
 		for i := 0; i < len(p.Ranges); i++ {
 			refineRange(p.Ranges[i], p.Index)
+		}
+	}
+
+	if len(p.Ranges) > 0 && len(p.Ranges[0].LowVal) < len(p.Index.Columns) {
+		for _, ran := range p.Ranges {
+			if ran.HighExclude || ran.LowExclude {
+				if ran.HighExclude {
+					ran.HighVal = append(ran.HighVal, types.NewDatum(nil))
+				} else {
+					ran.HighVal = append(ran.HighVal, types.MaxValueDatum())
+				}
+				if ran.LowExclude {
+					ran.LowVal = append(ran.LowVal, types.MaxValueDatum())
+				} else {
+					ran.LowVal = append(ran.LowVal, types.NewDatum(nil))
+				}
+			}
 		}
 	}
 	return errors.Trace(rb.err)
@@ -95,16 +114,16 @@ func getEQFunctionOffset(expr expression.Expression, cols []*model.IndexColumn) 
 	if !ok || f.FuncName.L != ast.EQ {
 		return -1
 	}
-	if c, ok := f.Args[0].(*expression.Column); ok {
-		if _, ok := f.Args[1].(*expression.Constant); ok {
+	if c, ok := f.GetArgs()[0].(*expression.Column); ok {
+		if _, ok := f.GetArgs()[1].(*expression.Constant); ok {
 			for i, col := range cols {
 				if col.Name.L == c.ColName.L {
 					return i
 				}
 			}
 		}
-	} else if _, ok := f.Args[0].(*expression.Constant); ok {
-		if c, ok := f.Args[1].(*expression.Column); ok {
+	} else if _, ok := f.GetArgs()[0].(*expression.Constant); ok {
+		if c, ok := f.GetArgs()[1].(*expression.Column); ok {
 			for i, col := range cols {
 				if col.Name.L == c.ColName.L {
 					return i
@@ -127,12 +146,54 @@ func removeAccessConditions(conditions, accessConds []expression.Expression) []e
 	return conditions
 }
 
+// checkIndexCondition will check whether all columns of condition is index columns or primary key column.
+func checkIndexCondition(condition expression.Expression, indexColumns []*model.IndexColumn, pKName model.CIStr) bool {
+	cols := expression.ExtractColumns(condition)
+	for _, col := range cols {
+		if pKName.L == col.ColName.L {
+			continue
+		}
+		isIndexColumn := false
+		for _, indCol := range indexColumns {
+			if col.ColName.L == indCol.Name.L && indCol.Length == types.UnspecifiedLength {
+				isIndexColumn = true
+				break
+			}
+		}
+		if !isIndexColumn {
+			return false
+		}
+	}
+	return true
+}
+
+func detachIndexFilterConditions(conditions []expression.Expression, indexColumns []*model.IndexColumn, table *model.TableInfo) ([]expression.Expression, []expression.Expression) {
+	var pKName model.CIStr
+	if table.PKIsHandle {
+		for _, colInfo := range table.Columns {
+			if mysql.HasPriKeyFlag(colInfo.Flag) {
+				pKName = colInfo.Name
+				break
+			}
+		}
+	}
+	var indexConditions, tableConditions []expression.Expression
+	for _, cond := range conditions {
+		if checkIndexCondition(cond, indexColumns, pKName) {
+			indexConditions = append(indexConditions, cond)
+		} else {
+			tableConditions = append(tableConditions, cond)
+		}
+	}
+	return indexConditions, tableConditions
+}
+
 func detachIndexScanConditions(conditions []expression.Expression, indexScan *PhysicalIndexScan) ([]expression.Expression, []expression.Expression) {
 	accessConds := make([]expression.Expression, len(indexScan.Index.Columns))
 	var filterConds []expression.Expression
 	// pushDownNot here can convert query 'not (a != 1)' to 'a = 1'.
 	for i, cond := range conditions {
-		conditions[i] = pushDownNot(cond, false)
+		conditions[i] = pushDownNot(cond, false, nil)
 	}
 	for _, cond := range conditions {
 		offset := getEQFunctionOffset(cond, indexScan.Index.Columns)
@@ -154,14 +215,14 @@ func detachIndexScanConditions(conditions []expression.Expression, indexScan *Ph
 		}
 	}
 	indexScan.accessInAndEqCount = indexScan.accessEqualCount
-	// We should remove all accessConds , so that they will not be added to filter conditions.
+	// We should remove all accessConds, so that they will not be added to filter conditions.
 	conditions = removeAccessConditions(conditions, accessConds)
 	var curIndex int
 	for curIndex = indexScan.accessEqualCount; curIndex < len(indexScan.Index.Columns); curIndex++ {
 		checker := &conditionChecker{
-			tableName:    indexScan.Table.Name,
 			idx:          indexScan.Index,
 			columnOffset: curIndex,
+			length:       indexScan.Index.Columns[curIndex].Length,
 		}
 		// First of all, we should extract all of in/eq expressions from rest conditions for every continuous index column.
 		// e.g. For index (a,b,c) and conditions a in (1,2) and b < 1 and c in (3,4), we should only extract column a in (1,2).
@@ -202,10 +263,11 @@ func detachTableScanConditions(conditions []expression.Expression, table *model.
 
 	var accessConditions, filterConditions []expression.Expression
 	checker := conditionChecker{
-		tableName: table.Name,
-		pkName:    pkName}
+		pkName: pkName,
+		length: types.UnspecifiedLength,
+	}
 	for _, cond := range conditions {
-		cond = pushDownNot(cond, false)
+		cond = pushDownNot(cond, false, nil)
 		if !checker.check(cond) {
 			filterConditions = append(filterConditions, cond)
 			continue
@@ -227,7 +289,7 @@ func buildTableRange(p *PhysicalTableScan) error {
 		return nil
 	}
 
-	rb := rangeBuilder{}
+	rb := rangeBuilder{sc: p.ctx.GetSessionVars().StmtCtx}
 	rangePoints := fullRange
 	for _, cond := range p.AccessCondition {
 		rangePoints = rb.intersection(rangePoints, rb.build(cond))
@@ -241,11 +303,11 @@ func buildTableRange(p *PhysicalTableScan) error {
 
 // conditionChecker checks if this condition can be pushed to index plan.
 type conditionChecker struct {
-	tableName     model.CIStr
 	idx           *model.IndexInfo
 	columnOffset  int // the offset of the indexed column to be checked.
 	pkName        model.CIStr
 	shouldReserve bool // check if a access condition should be reserved in filter conditions.
+	length        int
 }
 
 func (c *conditionChecker) check(condition expression.Expression) bool {
@@ -295,19 +357,23 @@ func (c *conditionChecker) findEqOrInFunc(conditions []expression.Expression) in
 func (c *conditionChecker) checkScalarFunction(scalar *expression.ScalarFunction) bool {
 	switch scalar.FuncName.L {
 	case ast.OrOr, ast.AndAnd:
-		return c.check(scalar.Args[0]) && c.check(scalar.Args[1])
+		return c.check(scalar.GetArgs()[0]) && c.check(scalar.GetArgs()[1])
 	case ast.EQ, ast.NE, ast.GE, ast.GT, ast.LE, ast.LT:
-		if _, ok := scalar.Args[0].(*expression.Constant); ok {
-			return c.checkColumn(scalar.Args[1])
+		if _, ok := scalar.GetArgs()[0].(*expression.Constant); ok {
+			if c.checkColumn(scalar.GetArgs()[1]) {
+				return scalar.FuncName.L != ast.NE || c.length == types.UnspecifiedLength
+			}
 		}
-		if _, ok := scalar.Args[1].(*expression.Constant); ok {
-			return c.checkColumn(scalar.Args[0])
+		if _, ok := scalar.GetArgs()[1].(*expression.Constant); ok {
+			if c.checkColumn(scalar.GetArgs()[0]) {
+				return scalar.FuncName.L != ast.NE || c.length == types.UnspecifiedLength
+			}
 		}
 	case ast.IsNull, ast.IsTruth, ast.IsFalsity:
-		return c.checkColumn(scalar.Args[0])
+		return c.checkColumn(scalar.GetArgs()[0])
 	case ast.UnaryNot:
 		// TODO: support "not like" and "not in" convert to access conditions.
-		if s, ok := scalar.Args[0].(*expression.ScalarFunction); ok {
+		if s, ok := scalar.GetArgs()[0].(*expression.ScalarFunction); ok {
 			if s.FuncName.L == ast.In || s.FuncName.L == ast.Like {
 				return false
 			}
@@ -315,12 +381,12 @@ func (c *conditionChecker) checkScalarFunction(scalar *expression.ScalarFunction
 			// "not column" or "not constant" can't lead to a range.
 			return false
 		}
-		return c.check(scalar.Args[0])
+		return c.check(scalar.GetArgs()[0])
 	case ast.In:
-		if !c.checkColumn(scalar.Args[0]) {
+		if !c.checkColumn(scalar.GetArgs()[0]) {
 			return false
 		}
-		for _, v := range scalar.Args[1:] {
+		for _, v := range scalar.GetArgs()[1:] {
 			if _, ok := v.(*expression.Constant); !ok {
 				return false
 			}
@@ -333,10 +399,10 @@ func (c *conditionChecker) checkScalarFunction(scalar *expression.ScalarFunction
 }
 
 func (c *conditionChecker) checkLikeFunc(scalar *expression.ScalarFunction) bool {
-	if !c.checkColumn(scalar.Args[0]) {
+	if !c.checkColumn(scalar.GetArgs()[0]) {
 		return false
 	}
-	pattern, ok := scalar.Args[1].(*expression.Constant)
+	pattern, ok := scalar.GetArgs()[1].(*expression.Constant)
 	if !ok {
 		return false
 	}
@@ -350,7 +416,7 @@ func (c *conditionChecker) checkLikeFunc(scalar *expression.ScalarFunction) bool
 	if len(patternStr) == 0 {
 		return true
 	}
-	escape := byte(scalar.Args[2].(*expression.Constant).Value.GetInt64())
+	escape := byte(scalar.GetArgs()[2].(*expression.Constant).Value.GetInt64())
 	for i := 0; i < len(patternStr); i++ {
 		if patternStr[i] == escape {
 			i++
@@ -399,50 +465,50 @@ var oppositeOp = map[string]string{
 	ast.NE: ast.EQ,
 }
 
-func pushDownNot(expr expression.Expression, not bool) expression.Expression {
+func pushDownNot(expr expression.Expression, not bool, ctx context.Context) expression.Expression {
 	if f, ok := expr.(*expression.ScalarFunction); ok {
 		switch f.FuncName.L {
 		case ast.UnaryNot:
-			return pushDownNot(f.Args[0], !not)
+			return pushDownNot(f.GetArgs()[0], !not, f.GetCtx())
 		case ast.LT, ast.GE, ast.GT, ast.LE, ast.EQ, ast.NE:
 			if not {
-				nf, _ := expression.NewFunction(oppositeOp[f.FuncName.L], f.GetType(), f.Args...)
+				nf, _ := expression.NewFunction(f.GetCtx(), oppositeOp[f.FuncName.L], f.GetType(), f.GetArgs()...)
 				return nf
 			}
-			for i, arg := range f.Args {
-				f.Args[i] = pushDownNot(arg, false)
+			for i, arg := range f.GetArgs() {
+				f.GetArgs()[i] = pushDownNot(arg, false, f.GetCtx())
 			}
 			return f
 		case ast.AndAnd:
 			if not {
-				args := f.Args
+				args := f.GetArgs()
 				for i, a := range args {
-					args[i] = pushDownNot(a, true)
+					args[i] = pushDownNot(a, true, f.GetCtx())
 				}
-				nf, _ := expression.NewFunction(ast.OrOr, f.GetType(), args...)
+				nf, _ := expression.NewFunction(f.GetCtx(), ast.OrOr, f.GetType(), args...)
 				return nf
 			}
-			for i, arg := range f.Args {
-				f.Args[i] = pushDownNot(arg, false)
+			for i, arg := range f.GetArgs() {
+				f.GetArgs()[i] = pushDownNot(arg, false, f.GetCtx())
 			}
 			return f
 		case ast.OrOr:
 			if not {
-				args := f.Args
+				args := f.GetArgs()
 				for i, a := range args {
-					args[i] = pushDownNot(a, true)
+					args[i] = pushDownNot(a, true, f.GetCtx())
 				}
-				nf, _ := expression.NewFunction(ast.AndAnd, f.GetType(), args...)
+				nf, _ := expression.NewFunction(f.GetCtx(), ast.AndAnd, f.GetType(), args...)
 				return nf
 			}
-			for i, arg := range f.Args {
-				f.Args[i] = pushDownNot(arg, false)
+			for i, arg := range f.GetArgs() {
+				f.GetArgs()[i] = pushDownNot(arg, false, f.GetCtx())
 			}
 			return f
 		}
 	}
 	if not {
-		expr, _ = expression.NewFunction(ast.UnaryNot, types.NewFieldType(mysql.TypeTiny), expr)
+		expr, _ = expression.NewFunction(ctx, ast.UnaryNot, types.NewFieldType(mysql.TypeTiny), expr)
 	}
 	return expr
 }

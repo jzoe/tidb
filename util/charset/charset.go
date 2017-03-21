@@ -46,6 +46,7 @@ var charsetInfos = []*Charset{
 	{"latin1", nil, make(map[string]*Collation), "cp1252 West European", 1},
 	{"utf8mb4", nil, make(map[string]*Collation), "UTF-8 Unicode", 4},
 	{"ascii", nil, make(map[string]*Collation), "US ASCII", 1},
+	{"binary", nil, make(map[string]*Collation), "binary", 1},
 }
 
 func init() {
@@ -118,7 +119,8 @@ func ValidCharsetAndCollation(cs string, co string) bool {
 
 // GetDefaultCollation returns the default collation for charset.
 func GetDefaultCollation(charset string) (string, error) {
-	if strings.ToLower(charset) == CharsetBin {
+	charset = strings.ToLower(charset)
+	if charset == CharsetBin {
 		return CollationBin, nil
 	}
 	c, ok := charsets[charset]

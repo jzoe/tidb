@@ -18,6 +18,9 @@ import (
 	"strings"
 
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -25,6 +28,11 @@ import (
 type TableRange struct {
 	LowVal  int64
 	HighVal int64
+}
+
+// IsPoint returns if the table range is a point.
+func (tr *TableRange) IsPoint() bool {
+	return tr.HighVal == tr.LowVal
 }
 
 // ShowDDL is for showing DDL information.
@@ -47,8 +55,18 @@ type IndexRange struct {
 	HighExclude bool
 }
 
+func datumToString(d types.Datum) string {
+	if d.Kind() == types.KindMinNotNull {
+		return "-inf"
+	}
+	if d.Kind() == types.KindMaxValue {
+		return "+inf"
+	}
+	return fmt.Sprintf("%v", d.GetValue())
+}
+
 // IsPoint returns if the index range is a point.
-func (ir *IndexRange) IsPoint() bool {
+func (ir *IndexRange) IsPoint(sc *variable.StatementContext) bool {
 	if len(ir.LowVal) != len(ir.HighVal) {
 		return false
 	}
@@ -58,7 +76,7 @@ func (ir *IndexRange) IsPoint() bool {
 		if a.Kind() == types.KindMinNotNull || b.Kind() == types.KindMaxValue {
 			return false
 		}
-		cmp, err := a.CompareDatum(b)
+		cmp, err := a.CompareDatum(sc, b)
 		if err != nil {
 			return false
 		}
@@ -72,19 +90,11 @@ func (ir *IndexRange) IsPoint() bool {
 func (ir *IndexRange) String() string {
 	lowStrs := make([]string, 0, len(ir.LowVal))
 	for _, d := range ir.LowVal {
-		if d.Kind() == types.KindMinNotNull {
-			lowStrs = append(lowStrs, "-inf")
-		} else {
-			lowStrs = append(lowStrs, fmt.Sprintf("%v", d.GetValue()))
-		}
+		lowStrs = append(lowStrs, datumToString(d))
 	}
 	highStrs := make([]string, 0, len(ir.LowVal))
 	for _, d := range ir.HighVal {
-		if d.Kind() == types.KindMaxValue {
-			highStrs = append(highStrs, "+inf")
-		} else {
-			highStrs = append(highStrs, fmt.Sprintf("%v", d.GetValue()))
-		}
+		highStrs = append(highStrs, datumToString(d))
 	}
 	l, r := "[", "]"
 	if ir.LowExclude {
@@ -111,11 +121,6 @@ type Limit struct {
 	Count  uint64
 }
 
-// Distinct represents Distinct plan.
-type Distinct struct {
-	baseLogicalPlan
-}
-
 // Prepare represents prepare plan.
 type Prepare struct {
 	basePlan
@@ -129,8 +134,8 @@ type Execute struct {
 	basePlan
 
 	Name      string
-	UsingVars []ast.ExprNode
-	ID        uint32
+	UsingVars []expression.Expression
+	ExecID    uint32
 }
 
 // Deallocate represents deallocate plan.
@@ -156,6 +161,13 @@ type Show struct {
 	GlobalScope bool
 }
 
+// Set represents a plan for set stmt.
+type Set struct {
+	basePlan
+
+	VarAssigns []*expression.VarAssignment
+}
+
 // Simple represents a simple statement plan which doesn't need any optimization.
 type Simple struct {
 	basePlan
@@ -167,15 +179,26 @@ type Simple struct {
 type Insert struct {
 	baseLogicalPlan
 
-	Table       *ast.TableRefsClause
+	Table       table.Table
+	tableSchema *expression.Schema
 	Columns     []*ast.ColumnName
-	Lists       [][]ast.ExprNode
-	Setlist     []*ast.Assignment
-	OnDuplicate []*ast.Assignment
+	Lists       [][]expression.Expression
+	Setlist     []*expression.Assignment
+	OnDuplicate []*expression.Assignment
 
 	IsReplace bool
 	Priority  int
 	Ignore    bool
+}
+
+// Analyze represents an analyze plan
+type Analyze struct {
+	baseLogicalPlan
+
+	Table      *ast.TableName
+	IdxOffsets []int
+	ColOffsets []int
+	PkOffset   int // Used only when pk is handle.
 }
 
 // LoadData represents a loaddata plan.

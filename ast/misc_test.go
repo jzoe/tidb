@@ -45,6 +45,7 @@ func (visitor1) Enter(in Node) (Node, bool) {
 func (ts *testMiscSuite) TestMiscVisitorCover(c *C) {
 	stmts := []Node{
 		(&AdminStmt{}),
+		(&AlterUserStmt{}),
 		(&BeginStmt{}),
 		(&BinlogStmt{}),
 		(&CommitStmt{}),
@@ -68,7 +69,7 @@ func (ts *testMiscSuite) TestMiscVisitorCover(c *C) {
 				{},
 			},
 		}),
-		(&FlushTableStmt{}),
+		(&FlushStmt{}),
 		(&PrivElem{}),
 		(&VariableAssignment{Value: &ValueExpr{}}),
 	}

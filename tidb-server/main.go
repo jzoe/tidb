@@ -27,9 +27,11 @@ import (
 	"github.com/ngaut/log"
 	"github.com/ngaut/systimemon"
 	"github.com/pingcap/tidb"
+	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/perfschema"
 	"github.com/pingcap/tidb/plan"
+	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/server"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/store/localstore/boltdb"
@@ -42,7 +44,7 @@ import (
 )
 
 var (
-	version         = flag.Bool("v", false, "print version information and exit")
+	version         = flag.Bool("V", false, "print version information and exit")
 	store           = flag.String("store", "goleveldb", "registered store name, [memory, goleveldb, boltdb, tikv]")
 	storePath       = flag.String("path", "/tmp/tidb", "tidb storage path")
 	logLevel        = flag.String("L", "info", "log level: info, debug, warn, error, fatal")
@@ -52,6 +54,7 @@ var (
 	lease           = flag.String("lease", "1s", "schema lease duration, very dangerous to change only if you know what you do")
 	socket          = flag.String("socket", "", "The socket file to use for connection.")
 	enablePS        = flag.Bool("perfschema", false, "If enable performance schema.")
+	enablePrivilege = flag.Bool("privilege", false, "If enable privilege check feature.")
 	reportStatus    = flag.Bool("report-status", true, "If enable status report HTTP service.")
 	logFile         = flag.String("log-file", "", "log file path")
 	joinCon         = flag.Int("join-concurrency", 5, "the number of goroutines that participate joining.")
@@ -59,6 +62,16 @@ var (
 	metricsAddr     = flag.String("metrics-addr", "", "prometheus pushgateway address, leaves it empty will disable prometheus push.")
 	metricsInterval = flag.Int("metrics-interval", 15, "prometheus client push interval in second, set \"0\" to disable prometheus push.")
 	binlogSocket    = flag.String("binlog-socket", "", "socket file to write binlog")
+	runDDL          = flag.Bool("run-ddl", true, "run ddl worker on this tidb-server")
+	retryLimit      = flag.Int("retry-limit", 10, "the maximum number of retries when commit a transaction")
+
+	timeJumpBackCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "monitor",
+			Name:      "time_jump_back_total",
+			Help:      "Counter of system time jumps backward.",
+		})
 )
 
 func main() {
@@ -75,6 +88,8 @@ func main() {
 
 	leaseDuration := parseLease()
 	tidb.SetSchemaLease(leaseDuration)
+	ddl.RunWorker = *runDDL
+	tidb.SetCommitRetryLimit(*retryLimit)
 
 	cfg := &server.Config{
 		Addr:         fmt.Sprintf("%s:%s", *host, *port),
@@ -82,6 +97,8 @@ func main() {
 		StatusAddr:   fmt.Sprintf(":%s", *statusPort),
 		Socket:       *socket,
 		ReportStatus: *reportStatus,
+		Store:        *store,
+		StorePath:    *storePath,
 	}
 
 	// set log options
@@ -91,6 +108,7 @@ func main() {
 			log.Fatal(errors.ErrorStack(err))
 		}
 		log.SetRotateByDay()
+		log.SetHighlighting(false)
 	}
 
 	if joinCon != nil && *joinCon > 0 {
@@ -106,16 +124,16 @@ func main() {
 	if *enablePS {
 		perfschema.EnablePerfSchema()
 	}
+	privileges.Enable = *enablePrivilege
 	if *binlogSocket != "" {
 		createBinlogClient()
 	}
 
-	// Create a session to load information schema.
-	se, err := tidb.CreateSession(store)
+	// Bootstrap a session to load information schema.
+	_, err := tidb.BootstrapSession(store)
 	if err != nil {
 		log.Fatal(errors.ErrorStack(err))
 	}
-	se.Close()
 
 	var driver server.IDriver
 	driver = server.NewTiDBDriver(store)
@@ -139,8 +157,9 @@ func main() {
 		os.Exit(0)
 	}()
 
+	prometheus.MustRegister(timeJumpBackCounter)
 	go systimemon.StartMonitor(time.Now, func() {
-		log.Error("error: system time jump backward")
+		timeJumpBackCounter.Inc()
 	})
 
 	pushMetric(*metricsAddr, time.Duration(*metricsInterval)*time.Second)
@@ -166,6 +185,7 @@ func createBinlogClient() {
 		log.Fatal(errors.ErrorStack(err))
 	}
 	binloginfo.PumpClient = binlog.NewPumpClient(clientCon)
+	log.Infof("created binlog client at %s", *binlogSocket)
 }
 
 // Prometheus push.
@@ -177,7 +197,7 @@ func pushMetric(addr string, interval time.Duration) {
 		log.Info("disable Prometheus push client")
 		return
 	}
-	log.Infof("start Prometheus push client with server addr %s and interval %d", addr, interval)
+	log.Infof("start Prometheus push client with server addr %s and interval %s", addr, interval)
 	go prometheusPushClient(addr, interval)
 }
 

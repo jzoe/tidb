@@ -19,6 +19,8 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 )
@@ -137,7 +139,7 @@ func (s *testColumnSuite) TestGetZeroValue(c *C) {
 		},
 		{
 			types.NewFieldType(mysql.TypeNewDecimal),
-			types.NewDecimalDatum(mysql.NewDecFromInt(0)),
+			types.NewDecimalDatum(types.NewDecFromInt(0)),
 		},
 		{
 			types.NewFieldType(mysql.TypeVarchar),
@@ -149,50 +151,140 @@ func (s *testColumnSuite) TestGetZeroValue(c *C) {
 		},
 		{
 			types.NewFieldType(mysql.TypeDuration),
-			types.NewDurationDatum(mysql.ZeroDuration),
+			types.NewDurationDatum(types.ZeroDuration),
 		},
 		{
 			types.NewFieldType(mysql.TypeDatetime),
-			types.NewDatum(mysql.ZeroDatetime),
+			types.NewDatum(types.ZeroDatetime),
 		},
 		{
 			types.NewFieldType(mysql.TypeTimestamp),
-			types.NewDatum(mysql.ZeroTimestamp),
+			types.NewDatum(types.ZeroTimestamp),
 		},
 		{
 			types.NewFieldType(mysql.TypeDate),
-			types.NewDatum(mysql.ZeroDate),
+			types.NewDatum(types.ZeroDate),
 		},
 		{
 			types.NewFieldType(mysql.TypeBit),
-			types.NewDatum(mysql.Bit{Value: 0, Width: mysql.MinBitWidth}),
+			types.NewDatum(types.Bit{Value: 0, Width: types.MinBitWidth}),
 		},
 		{
 			types.NewFieldType(mysql.TypeSet),
-			types.NewDatum(mysql.Set{}),
+			types.NewDatum(types.Set{}),
 		},
 	}
+	sc := new(variable.StatementContext)
 	for _, ca := range cases {
 		colInfo := &model.ColumnInfo{FieldType: *ca.ft}
 		zv := GetZeroValue(colInfo)
 		c.Assert(zv.Kind(), Equals, ca.value.Kind())
-		cmp, err := zv.CompareDatum(ca.value)
+		cmp, err := zv.CompareDatum(sc, ca.value)
 		c.Assert(err, IsNil)
 		c.Assert(cmp, Equals, 0)
 	}
 }
 
 func (s *testColumnSuite) TestGetDefaultValue(c *C) {
-	colInfo := &model.ColumnInfo{
-		FieldType:    *types.NewFieldType(mysql.TypeLong),
-		State:        model.StatePublic,
-		DefaultValue: 1.0,
+	tcases := []struct {
+		colInfo *model.ColumnInfo
+		strict  bool
+		val     types.Datum
+		err     error
+	}{
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp:   mysql.TypeLonglong,
+					Flag: mysql.NotNullFlag,
+				},
+				DefaultValue: 1.0,
+			},
+			false,
+			types.NewIntDatum(1),
+			nil,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp:   mysql.TypeLonglong,
+					Flag: mysql.NotNullFlag,
+				},
+			},
+			false,
+			types.NewIntDatum(0),
+			nil,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp: mysql.TypeLonglong,
+				},
+			},
+			false,
+			types.Datum{},
+			nil,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp:    mysql.TypeEnum,
+					Flag:  mysql.NotNullFlag,
+					Elems: []string{"abc", "def"},
+				},
+			},
+			false,
+			types.NewStringDatum("abc"),
+			nil,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp:   mysql.TypeTimestamp,
+					Flag: mysql.TimestampFlag,
+				},
+				DefaultValue: "0000-00-00 00:00:00",
+			},
+			false,
+			types.NewDatum(types.ZeroTimestamp),
+			nil,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp:   mysql.TypeLonglong,
+					Flag: mysql.NotNullFlag,
+				},
+			},
+			true,
+			types.NewDatum(types.ZeroTimestamp),
+			errNoDefaultValue,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp:   mysql.TypeLonglong,
+					Flag: mysql.NotNullFlag | mysql.AutoIncrementFlag,
+				},
+			},
+			true,
+			types.Datum{},
+			nil,
+		},
 	}
-	val, ok, err := GetColDefaultValue(nil, colInfo)
-	c.Assert(err, IsNil)
-	c.Assert(ok, IsTrue)
-	c.Assert(val.Kind(), Equals, types.KindInt64)
-	c.Assert(val.GetInt64(), Equals, int64(1))
+
+	ctx := mock.NewContext()
+
+	for _, tc := range tcases {
+		ctx.GetSessionVars().StrictSQLMode = tc.strict
+		val, err := GetColDefaultValue(ctx, tc.colInfo)
+		if err != nil {
+			c.Assert(tc.err, NotNil, Commentf("%v", err))
+			continue
+		}
+		c.Assert(val, DeepEquals, tc.val)
+	}
+
 }
 
 func newCol(name string) *Column {

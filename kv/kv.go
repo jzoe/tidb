@@ -15,6 +15,8 @@ package kv
 
 import (
 	"io"
+
+	goctx "golang.org/x/net/context"
 )
 
 // Transaction options
@@ -27,10 +29,22 @@ const (
 	// PresumeKeyNotExistsError is the option key for error.
 	// When PresumeKeyNotExists is set and condition is not match, should throw the error.
 	PresumeKeyNotExistsError
-	// RetryAttempts is the number of txn retry attempt.
-	RetryAttempts
 	// BinlogData is the binlog data to write.
 	BinlogData
+	// Skip existing check when "prewrite".
+	SkipCheckForWrite
+	// SchemaLeaseChecker is used for schema lease check.
+	SchemaLeaseChecker
+)
+
+// Those limits is enforced to make sure the transaction can be well handled by TiKV.
+const (
+	// The limit of single entry size (len(key) + len(value)).
+	TxnEntrySizeLimit = 6 * 1024 * 1024
+	// The limit of number of entries in the MemBuffer.
+	TxnEntryCountLimit = 300 * 1000
+	// The limit of the sum of all entry size.
+	TxnTotalSizeLimit = 100 * 1024 * 1024
 )
 
 // Retriever is the interface wraps the basic Get and Seek methods.
@@ -65,12 +79,18 @@ type RetrieverMutator interface {
 }
 
 // MemBuffer is an in-memory kv collection, can be used to buffer write operations.
-type MemBuffer RetrieverMutator
+type MemBuffer interface {
+	RetrieverMutator
+	// Size returns sum of keys and values length.
+	Size() int
+	// Len returns the number of entries in the DB.
+	Len() int
+}
 
 // Transaction defines the interface for operations inside a Transaction.
 // This is not thread safe.
 type Transaction interface {
-	RetrieverMutator
+	MemBuffer
 	// Commit commits the transaction operations to KV store.
 	Commit() error
 	// Rollback undoes the transaction operations to KV store.
@@ -88,12 +108,15 @@ type Transaction interface {
 	IsReadOnly() bool
 	// StartTS returns the transaction start timestamp.
 	StartTS() uint64
+	// Valid returns if the transaction is valid.
+	// A transaction become invalid after commit or rollback.
+	Valid() bool
 }
 
 // Client is used to send request to KV layer.
 type Client interface {
 	// Send sends request to KV layer, returns a Response.
-	Send(req *Request) Response
+	Send(ctx goctx.Context, req *Request) Response
 
 	// SupportRequestType checks if reqType and subType is supported.
 	SupportRequestType(reqType, subType int64) bool
@@ -131,6 +154,7 @@ type Request struct {
 type Response interface {
 	// Next returns a resultSubset from a single storage unit.
 	// When full result set is returned, nil is returned.
+	// TODO: Find a better interface for resultSubset that can avoid allocation and reuse bytes.
 	Next() (resultSubset io.ReadCloser, err error)
 	// Close response.
 	Close() error
@@ -155,6 +179,8 @@ type Driver interface {
 type Storage interface {
 	// Begin transaction
 	Begin() (Transaction, error)
+	// BeginWithStartTS begins transaction with startTS.
+	BeginWithStartTS(startTS uint64) (Transaction, error)
 	// GetSnapshot gets a snapshot that is able to read any data which data is <= ver.
 	// if ver is MaxVersion or > current max committed version, we will use current version for this snapshot.
 	GetSnapshot(ver Version) (Snapshot, error)

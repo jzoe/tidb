@@ -20,17 +20,27 @@ import (
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/autocommit"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/testleak"
 )
 
-func (s *testSessionSuite) TestBootstrap(c *C) {
+var _ = Suite(&testBootstrapSuite{})
+
+type testBootstrapSuite struct {
+	dbName          string
+	dbNameBootstrap string
+}
+
+func (s *testBootstrapSuite) SetUpSuite(c *C) {
+	s.dbName = "test_bootstrap"
+	s.dbNameBootstrap = "test_main_db_bootstrap"
+}
+
+func (s *testBootstrapSuite) TestBootstrap(c *C) {
 	defer testleak.AfterTest(c)()
-	store := newStore(c, s.dbName)
+	store := newStoreWithBootstrap(c, s.dbName)
 	se := newSession(c, store, s.dbName)
 	mustExecSQL(c, se, "USE mysql;")
 	r := mustExecSQL(c, se, `select * from user;`)
@@ -51,7 +61,7 @@ func (s *testSessionSuite) TestBootstrap(c *C) {
 	c.Assert(r, NotNil)
 	v, err := r.Next()
 	c.Assert(err, IsNil)
-	c.Assert(v.Data[0].GetInt64(), Equals, int64(len(variable.SysVars)))
+	c.Assert(v.Data[0].GetInt64(), Equals, globalVarsCount())
 
 	// Check a storage operations are default autocommit after the second start.
 	mustExecSQL(c, se, "USE test;")
@@ -85,21 +95,28 @@ func (s *testSessionSuite) TestBootstrap(c *C) {
 	c.Assert(err, IsNil)
 }
 
+func globalVarsCount() int64 {
+	var count int64
+	for _, v := range variable.SysVars {
+		if v.Scope != variable.ScopeSession {
+			count++
+		}
+	}
+	return count
+}
+
 // Create a new session on store but only do ddl works.
-func (s *testSessionSuite) bootstrapWithOnlyDDLWork(store kv.Storage, c *C) {
+func (s *testBootstrapSuite) bootstrapWithOnlyDDLWork(store kv.Storage, c *C) {
 	ss := &session{
-		values: make(map[fmt.Stringer]interface{}),
-		store:  store,
-		parser: parser.New(),
+		values:      make(map[fmt.Stringer]interface{}),
+		store:       store,
+		parser:      parser.New(),
+		sessionVars: variable.NewSessionVars(),
 	}
 	ss.SetValue(context.Initing, true)
 	domain, err := domap.Get(store)
 	c.Assert(err, IsNil)
 	sessionctx.BindDomain(ss, domain)
-	variable.BindSessionVars(ss)
-	variable.GetSessionVars(ss).SetStatusFlag(mysql.ServerStatusAutocommit, true)
-	// session implements autocommit.Checker. Bind it to ctx
-	autocommit.BindAutocommitChecker(ss, ss)
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
 	b, err := checkBootstrapped(ss)
@@ -111,11 +128,12 @@ func (s *testSessionSuite) bootstrapWithOnlyDDLWork(store kv.Storage, c *C) {
 
 // When a session failed in bootstrap process (for example, the session is killed after doDDLWorks()).
 // We should make sure that the following session could finish the bootstrap process.
-func (s *testSessionSuite) TestBootstrapWithError(c *C) {
+func (s *testBootstrapSuite) testBootstrapWithError(c *C) {
 	defer testleak.AfterTest(c)()
 	store := newStore(c, s.dbNameBootstrap)
 	s.bootstrapWithOnlyDDLWork(store, c)
 
+	BootstrapSession(store)
 	se := newSession(c, store, s.dbNameBootstrap)
 	mustExecSQL(c, se, "USE mysql;")
 	r := mustExecSQL(c, se, `select * from user;`)
@@ -132,7 +150,7 @@ func (s *testSessionSuite) TestBootstrapWithError(c *C) {
 	r = mustExecSQL(c, se, "SELECT COUNT(*) from mysql.global_variables;")
 	v, err := r.Next()
 	c.Assert(err, IsNil)
-	c.Assert(v.Data[0].GetInt64(), Equals, int64(len(variable.SysVars)))
+	c.Assert(v.Data[0].GetInt64(), Equals, globalVarsCount())
 
 	r = mustExecSQL(c, se, `SELECT VARIABLE_VALUE from mysql.TiDB where VARIABLE_NAME="bootstrapped";`)
 	row, err = r.Next()
@@ -146,9 +164,9 @@ func (s *testSessionSuite) TestBootstrapWithError(c *C) {
 }
 
 // Test case for upgrade
-func (s *testSessionSuite) TestUpgrade(c *C) {
+func (s *testBootstrapSuite) TestUpgrade(c *C) {
 	defer testleak.AfterTest(c)()
-	store := newStore(c, s.dbName)
+	store := newStoreWithBootstrap(c, s.dbName)
 	se := newSession(c, store, s.dbName)
 	mustExecSQL(c, se, "USE mysql;")
 
@@ -190,6 +208,7 @@ func (s *testSessionSuite) TestUpgrade(c *C) {
 	c.Assert(ver, Equals, int64(0))
 
 	// Create a new session then upgrade() will run automatically.
+	BootstrapSession(store)
 	se2 := newSession(c, store, s.dbName)
 	r = mustExecSQL(c, se2, `SELECT VARIABLE_VALUE from mysql.TiDB where VARIABLE_NAME="tidb_server_version";`)
 	row, err = r.Next()

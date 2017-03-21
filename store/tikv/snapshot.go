@@ -22,7 +22,7 @@ import (
 	"github.com/ngaut/log"
 	pb "github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/kv"
-	"golang.org/x/net/context"
+	goctx "golang.org/x/net/context"
 )
 
 var (
@@ -57,7 +57,7 @@ func (s *tikvSnapshot) BatchGet(keys []kv.Key) (map[string][]byte, error) {
 
 	// We want [][]byte instead of []kv.Key, use some magic to save memory.
 	bytesKeys := *(*[][]byte)(unsafe.Pointer(&keys))
-	bo := NewBackoffer(batchGetMaxBackoff, context.Background())
+	bo := NewBackoffer(batchGetMaxBackoff, goctx.Background())
 
 	// Create a map to collect key-values from region servers.
 	var mu sync.Mutex
@@ -82,6 +82,8 @@ func (s *tikvSnapshot) batchGetKeysByRegions(bo *Backoffer, keys [][]byte, colle
 		return errors.Trace(err)
 	}
 
+	txnRegionsNumHistogram.WithLabelValues("snapshot").Observe(float64(len(groups)))
+
 	var batches []batchKeys
 	for id, g := range groups {
 		batches = appendBatchBySize(batches, id, g, func([]byte) int { return 1 }, batchGetSize)
@@ -101,7 +103,7 @@ func (s *tikvSnapshot) batchGetKeysByRegions(bo *Backoffer, keys [][]byte, colle
 	}
 	for i := 0; i < len(batches); i++ {
 		if e := <-ch; e != nil {
-			log.Warnf("snapshot batchGet failed: %v, tid: %d", e, s.version.Ver)
+			log.Debugf("snapshot batchGet failed: %v, tid: %d", e, s.version.Ver)
 			err = e
 		}
 	}
@@ -171,7 +173,7 @@ func (s *tikvSnapshot) batchGetSingleRegion(bo *Backoffer, batch batchKeys, coll
 
 // Get gets the value for key k from snapshot.
 func (s *tikvSnapshot) Get(k kv.Key) ([]byte, error) {
-	val, err := s.get(NewBackoffer(getMaxBackoff, context.Background()), k)
+	val, err := s.get(NewBackoffer(getMaxBackoff, goctx.Background()), k)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -190,11 +192,11 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 		},
 	}
 	for {
-		region, err := s.store.regionCache.GetRegion(bo, k)
+		loc, err := s.store.regionCache.LocateKey(bo, k)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		resp, err := s.store.SendKVReq(bo, req, region.VerID(), readTimeoutShort)
+		resp, err := s.store.SendKVReq(bo, req, loc.Region, readTimeoutShort)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -220,7 +222,7 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 				return nil, errors.Trace(err)
 			}
 			if !ok {
-				err = bo.Backoff(boTxnLock, errors.New(keyErr.String()))
+				err = bo.Backoff(boTxnLockFast, errors.New(keyErr.String()))
 				if err != nil {
 					return nil, errors.Trace(err)
 				}
@@ -248,7 +250,7 @@ func extractLockFromKeyErr(keyErr *pb.KeyError) (*Lock, error) {
 	}
 	if keyErr.Retryable != "" {
 		err := errors.Errorf("tikv restarts txn: %s", keyErr.GetRetryable())
-		log.Warn(err)
+		log.Debug(err)
 		return nil, errors.Annotate(err, txnRetryableMark)
 	}
 	if keyErr.Abort != "" {

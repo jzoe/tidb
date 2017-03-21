@@ -873,8 +873,8 @@ func (n *UpdateStmt) Accept(v Visitor) (Node, bool) {
 type Limit struct {
 	node
 
-	Offset uint64
-	Count  uint64
+	Count  ExprNode
+	Offset ExprNode
 }
 
 // Accept implements Node Accept interface.
@@ -883,6 +883,21 @@ func (n *Limit) Accept(v Visitor) (Node, bool) {
 	if skipChildren {
 		return v.Leave(newNode)
 	}
+	if n.Count != nil {
+		node, ok := n.Count.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Count = node.(ExprNode)
+	}
+	if n.Offset != nil {
+		node, ok := n.Offset.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Offset = node.(ExprNode)
+	}
+
 	n = newNode.(*Limit)
 	return v.Leave(n)
 }
@@ -910,6 +925,7 @@ const (
 	ShowIndex
 	ShowProcessList
 	ShowCreateDatabase
+	ShowEvents
 )
 
 // ShowStmt is a statement to provide information about databases, tables, columns and so on.
@@ -962,7 +978,7 @@ func (n *ShowStmt) Accept(v Visitor) (Node, bool) {
 	}
 
 	switch n.Tp {
-	case ShowTriggers, ShowProcedureStatus, ShowProcessList:
+	case ShowTriggers, ShowProcedureStatus, ShowProcessList, ShowEvents:
 		// We don't have any data to return for those types,
 		// but visiting Where may cause resolving error, so return here to avoid error.
 		return v.Leave(n)

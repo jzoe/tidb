@@ -23,7 +23,6 @@ import (
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
 	"github.com/pingcap/tidb/table"
@@ -57,7 +56,6 @@ func (s *testSuite) SetUpSuite(c *C) {
 
 	s.ctx = mock.NewContext()
 	s.ctx.Store = s.store
-	variable.BindSessionVars(s.ctx)
 
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
@@ -197,9 +195,10 @@ func (s *testSuite) TestScan(c *C) {
 	tb, err := tables.TableFromMeta(alloc, s.tbInfo)
 	c.Assert(err, IsNil)
 	indices := tb.Indices()
+	c.Assert(s.ctx.NewTxn(), IsNil)
 	_, err = tb.AddRecord(s.ctx, types.MakeDatums(1, 10, 11))
 	c.Assert(err, IsNil)
-	s.ctx.CommitTxn()
+	c.Assert(s.ctx.Txn().Commit(), IsNil)
 
 	record1 := &RecordData{Handle: int64(1), Values: types.MakeDatums(int64(1), int64(10), int64(11))}
 	record2 := &RecordData{Handle: int64(2), Values: types.MakeDatums(int64(2), int64(20), int64(21))}
@@ -209,9 +208,10 @@ func (s *testSuite) TestScan(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(records, DeepEquals, []*RecordData{record1})
 
+	c.Assert(s.ctx.NewTxn(), IsNil)
 	_, err = tb.AddRecord(s.ctx, record2.Values)
 	c.Assert(err, IsNil)
-	s.ctx.CommitTxn()
+	c.Assert(s.ctx.Txn().Commit(), IsNil)
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
 
@@ -248,10 +248,12 @@ func (s *testSuite) TestScan(c *C) {
 
 	s.testIndex(c, tb, tb.Indices()[0])
 
+	c.Assert(s.ctx.NewTxn(), IsNil)
 	err = tb.RemoveRecord(s.ctx, 1, record1.Values)
 	c.Assert(err, IsNil)
 	err = tb.RemoveRecord(s.ctx, 2, record2.Values)
 	c.Assert(err, IsNil)
+	c.Assert(s.ctx.Txn().Commit(), IsNil)
 }
 
 func newDiffRetError(prefix string, ra, rb *RecordData) string {

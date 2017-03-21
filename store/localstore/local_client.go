@@ -6,6 +6,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tipb/go-tipb"
+	goctx "golang.org/x/net/context"
 )
 
 type dbClient struct {
@@ -13,7 +14,7 @@ type dbClient struct {
 	regionInfo []*regionInfo
 }
 
-func (c *dbClient) Send(req *kv.Request) kv.Response {
+func (c *dbClient) Send(ctx goctx.Context, req *kv.Request) kv.Response {
 	it := &response{
 		client:      c,
 		concurrency: req.Concurrency,
@@ -77,10 +78,10 @@ func supportExpr(exprType tipb.ExprType) bool {
 	case tipb.ExprType_BitAnd, tipb.ExprType_BitOr, tipb.ExprType_BitXor, tipb.ExprType_BitNeg:
 		return true
 	// control functions
-	case tipb.ExprType_Case, tipb.ExprType_If:
+	case tipb.ExprType_Case, tipb.ExprType_If, tipb.ExprType_IfNull, tipb.ExprType_NullIf:
 		return true
 	// other functions
-	case tipb.ExprType_Coalesce:
+	case tipb.ExprType_Coalesce, tipb.ExprType_IsNull:
 		return true
 	case kv.ReqSubTypeDesc:
 		return true

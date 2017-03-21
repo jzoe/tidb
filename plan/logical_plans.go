@@ -16,7 +16,6 @@ package plan
 import (
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/plan/statistics"
@@ -35,8 +34,8 @@ const (
 	RightOuterJoin
 	// SemiJoin means if row a in table A matches some rows in B, just output a.
 	SemiJoin
-	// SemiJoinWithAux means if row a in table A matches some rows in B, output (a, true), otherwise, output (a, false).
-	SemiJoinWithAux
+	// LeftOuterSemiJoin means if row a in table A matches some rows in B, output (a, true), otherwise, output (a, false).
+	LeftOuterSemiJoin
 )
 
 // Join is the logical join plan.
@@ -58,10 +57,58 @@ type Join struct {
 	DefaultValues []types.Datum
 }
 
+func (p *Join) columnSubstitute(schema *expression.Schema, exprs []expression.Expression) {
+	for i, fun := range p.EqualConditions {
+		p.EqualConditions[i] = expression.ColumnSubstitute(fun, schema, exprs).(*expression.ScalarFunction)
+	}
+	for i, fun := range p.LeftConditions {
+		p.LeftConditions[i] = expression.ColumnSubstitute(fun, schema, exprs)
+	}
+	for i, fun := range p.RightConditions {
+		p.RightConditions[i] = expression.ColumnSubstitute(fun, schema, exprs)
+	}
+	for i, fun := range p.OtherConditions {
+		p.OtherConditions[i] = expression.ColumnSubstitute(fun, schema, exprs)
+	}
+}
+
+func (p *Join) attachOnConds(onConds []expression.Expression) {
+	eq, left, right, other := extractOnCondition(onConds, p.children[0].(LogicalPlan), p.children[1].(LogicalPlan))
+	p.EqualConditions = append(eq, p.EqualConditions...)
+	p.LeftConditions = append(left, p.LeftConditions...)
+	p.RightConditions = append(right, p.RightConditions...)
+	p.OtherConditions = append(other, p.OtherConditions...)
+}
+
+func (p *Join) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.basePlan.extractCorrelatedCols()
+	for _, fun := range p.EqualConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	for _, fun := range p.LeftConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	for _, fun := range p.RightConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	for _, fun := range p.OtherConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	return corCols
+}
+
 // Projection represents a select fields plan.
 type Projection struct {
 	baseLogicalPlan
 	Exprs []expression.Expression
+}
+
+func (p *Projection) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.basePlan.extractCorrelatedCols()
+	for _, expr := range p.Exprs {
+		corCols = append(corCols, extractCorColumns(expr)...)
+	}
+	return corCols
 }
 
 // Aggregation represents an aggregate plan.
@@ -70,10 +117,22 @@ type Aggregation struct {
 
 	AggFuncs     []expression.AggregationFunction
 	GroupByItems []expression.Expression
-	ctx          context.Context
 
 	// groupByCols stores the columns that are group-by items.
 	groupByCols []*expression.Column
+}
+
+func (p *Aggregation) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.basePlan.extractCorrelatedCols()
+	for _, expr := range p.GroupByItems {
+		corCols = append(corCols, extractCorColumns(expr)...)
+	}
+	for _, fun := range p.AggFuncs {
+		for _, arg := range fun.GetArgs() {
+			corCols = append(corCols, extractCorColumns(arg)...)
+		}
+	}
+	return corCols
 }
 
 // Selection means a filter.
@@ -89,15 +148,29 @@ type Selection struct {
 	onTable bool
 }
 
+func (p *Selection) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.basePlan.extractCorrelatedCols()
+	for _, cond := range p.Conditions {
+		corCols = append(corCols, extractCorColumns(cond)...)
+	}
+	return corCols
+}
+
 // Apply gets one row from outer executor and gets one row from inner executor according to outer row.
 type Apply struct {
-	baseLogicalPlan
+	Join
 
-	InnerPlan        LogicalPlan
-	Checker          *ApplyConditionChecker
-	corColsInCurPlan []*expression.CorrelatedColumn
-	// corColsInOuterPlan is the correlated columns that don't belong to this plan.
-	corColsInOuterPlan []*expression.CorrelatedColumn
+	corCols []*expression.CorrelatedColumn
+}
+
+func (p *Apply) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.Join.extractCorrelatedCols()
+	for i := len(corCols) - 1; i >= 0; i-- {
+		if p.children[0].Schema().Contains(&corCols[i].Column) {
+			corCols = append(corCols[:i], corCols[i+1:]...)
+		}
+	}
+	return corCols
 }
 
 // Exists checks if a query returns result.
@@ -119,23 +192,16 @@ type TableDual struct {
 type DataSource struct {
 	baseLogicalPlan
 
-	table   *ast.TableName
-	Table   *model.TableInfo
-	Columns []*model.ColumnInfo
-	DBName  *model.CIStr
-	Desc    bool
-	ctx     context.Context
+	indexHints []*ast.IndexHint
+	tableInfo  *model.TableInfo
+	Columns    []*model.ColumnInfo
+	DBName     model.CIStr
 
 	TableAsName *model.CIStr
 
 	LimitCount *int64
 
 	statisticTable *statistics.Table
-}
-
-// Trim trims extra columns in src rows.
-type Trim struct {
-	baseLogicalPlan
 }
 
 // Union represents Union plan.
@@ -149,6 +215,14 @@ type Sort struct {
 
 	ByItems   []*ByItems
 	ExecLimit *Limit
+}
+
+func (p *Sort) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.basePlan.extractCorrelatedCols()
+	for _, item := range p.ByItems {
+		corCols = append(corCols, extractCorColumns(item.Expr)...)
+	}
+	return corCols
 }
 
 // Update represents Update plan.
@@ -192,8 +266,8 @@ func InsertPlan(parent Plan, child Plan, insert Plan) error {
 
 // RemovePlan means removing a plan.
 func RemovePlan(p Plan) error {
-	parents := p.GetParents()
-	children := p.GetChildren()
+	parents := p.Parents()
+	children := p.Children()
 	if len(parents) > 1 || len(children) != 1 {
 		return SystemInternalErrorType.Gen("can't remove this plan")
 	}

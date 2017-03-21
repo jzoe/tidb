@@ -41,12 +41,14 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/executor"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/arena"
@@ -73,8 +75,9 @@ type clientConn struct {
 	salt         []byte            // random bytes used for authentication.
 	alloc        arena.Allocator   // an memory allocator for reducing memory allocation.
 	lastCmd      string            // latest sql query string, currently used for logging error.
-	ctx          IContext          // an interface to execute sql statements.
+	ctx          QueryCtx          // an interface to execute sql statements.
 	attrs        map[string]string // attributes parsed from client handshake response, not used for now.
+	killed       bool
 }
 
 func (cc *clientConn) String() string {
@@ -182,7 +185,14 @@ type handshakeResponse41 struct {
 	Attrs      map[string]string
 }
 
-func handshakeResponseFromData(packet *handshakeResponse41, data []byte) error {
+func handshakeResponseFromData(packet *handshakeResponse41, data []byte) (err error) {
+	defer func() {
+		// Check malformat packet cause out of range is disgusting, but don't panic!
+		if r := recover(); r != nil {
+			log.Errorf("handshake panic, packet data: %v", data)
+			err = mysql.ErrMalformPacket
+		}
+	}()
 	pos := 0
 	// capability
 	capability := binary.LittleEndian.Uint32(data[:4])
@@ -235,12 +245,17 @@ func handshakeResponseFromData(packet *handshakeResponse41, data []byte) error {
 	}
 
 	if capability&mysql.ClientConnectAtts > 0 {
+		if len(data[pos:]) == 0 {
+			// Defend some ill-formated packet, connection attribute is not important and can be ignored.
+			return nil
+		}
 		if num, null, off := parseLengthEncodedInt(data[pos:]); !null {
 			pos += off
 			kv := data[pos : pos+int(num)]
 			attrs, err := parseAttrs(kv)
 			if err != nil {
-				return errors.Trace(err)
+				log.Warn("parse attrs error:", errors.ErrorStack(err))
+				return nil
 			}
 			packet.Attrs = attrs
 			pos += int(num)
@@ -303,6 +318,7 @@ func (cc *clientConn) readHandshakeResponse() error {
 			return errors.Trace(mysql.NewErr(mysql.ErrAccessDenied, cc.user, host, "Yes"))
 		}
 	}
+	cc.ctx.SetSessionManager(cc.server)
 	return nil
 }
 
@@ -310,18 +326,19 @@ func (cc *clientConn) readHandshakeResponse() error {
 // it will be recovered and log the panic error.
 // This function returns and the connection is closed if there is an IO error or there is a panic.
 func (cc *clientConn) Run() {
+	const size = 4096
 	defer func() {
 		r := recover()
 		if r != nil {
-			const size = 4096
 			buf := make([]byte, size)
-			buf = buf[:runtime.Stack(buf, false)]
+			stackSize := runtime.Stack(buf, false)
+			buf = buf[:stackSize]
 			log.Errorf("lastCmd %s, %v, %s", cc.lastCmd, r, buf)
 		}
 		cc.Close()
 	}()
 
-	for {
+	for !cc.killed {
 		cc.alloc.Reset()
 		data, err := cc.readPacket()
 		if err != nil {
@@ -331,17 +348,82 @@ func (cc *clientConn) Run() {
 			return
 		}
 
-		if err := cc.dispatch(data); err != nil {
+		startTime := time.Now()
+		if err = cc.dispatch(data); err != nil {
 			if terror.ErrorEqual(err, io.EOF) {
+				cc.addMetrics(data[0], startTime, nil)
+				return
+			} else if terror.ErrorEqual(err, terror.ErrCritical) {
+				log.Errorf("[%d] critical error, stop the server listener %s",
+					cc.connectionID, errors.ErrorStack(err))
+				criticalErrorCounter.Add(1)
+				select {
+				case cc.server.stopListenerCh <- struct{}{}:
+				default:
+				}
 				return
 			}
-			cmd := string(data[1:])
-			log.Warnf("[%d] dispatch error:\n%s\n%s\n%s", cc.connectionID, cc, cmd, errors.ErrorStack(err))
+			log.Warnf("[%d] dispatch error:\n%s\n%s\n%s",
+				cc.connectionID, cc, queryStrForLog(string(data[1:])), errStrForLog(err))
 			cc.writeError(err)
 		}
-
+		cc.addMetrics(data[0], startTime, err)
 		cc.pkt.sequence = 0
 	}
+}
+
+func queryStrForLog(query string) string {
+	const size = 4096
+	if len(query) > size {
+		return query[:size] + fmt.Sprintf("(len: %d)", len(query))
+	}
+	return query
+}
+
+func errStrForLog(err error) string {
+	if kv.ErrKeyExists.Equal(err) {
+		// Do not log stack for duplicated entry error.
+		return err.Error()
+	}
+	return errors.ErrorStack(err)
+}
+
+func (cc *clientConn) addMetrics(cmd byte, startTime time.Time, err error) {
+	var label string
+	switch cmd {
+	case mysql.ComSleep:
+		label = "Sleep"
+	case mysql.ComQuit:
+		label = "Quit"
+	case mysql.ComQuery:
+		label = "Query"
+	case mysql.ComPing:
+		label = "Ping"
+	case mysql.ComInitDB:
+		label = "InitDB"
+	case mysql.ComFieldList:
+		label = "FieldList"
+	case mysql.ComStmtPrepare:
+		label = "StmtPrepare"
+	case mysql.ComStmtExecute:
+		label = "StmtExecute"
+	case mysql.ComStmtClose:
+		label = "StmtClose"
+	case mysql.ComStmtSendLongData:
+		label = "StmtSendLongData"
+	case mysql.ComStmtReset:
+		label = "StmtReset"
+	case mysql.ComSetOption:
+		label = "SetOption"
+	default:
+		label = strconv.Itoa(int(cmd))
+	}
+	if err != nil {
+		queryCounter.WithLabelValues(label, "Error").Inc()
+	} else {
+		queryCounter.WithLabelValues(label, "OK").Inc()
+	}
+	queryHistogram.Observe(time.Since(startTime).Seconds())
 }
 
 // dispatch handles client request based on command which is the first byte of the data.
@@ -351,13 +433,9 @@ func (cc *clientConn) dispatch(data []byte) error {
 	cmd := data[0]
 	data = data[1:]
 	cc.lastCmd = hack.String(data)
-
 	token := cc.server.getToken()
-
-	startTS := time.Now()
 	defer func() {
 		cc.server.releaseToken(token)
-		log.Debugf("[TIME_CMD] %v %d", time.Since(startTS), cmd)
 	}()
 
 	switch cmd {
@@ -373,14 +451,13 @@ func (cc *clientConn) dispatch(data []byte) error {
 		// Input payload may end with byte '\0', we didn't find related mysql document about it, but mysql
 		// implementation accept that case. So trim the last '\0' here as if the payload an EOF string.
 		// See http://dev.mysql.com/doc/internals/en/com-query.html
-		if data[len(data)-1] == 0 {
+		if len(data) > 0 && data[len(data)-1] == 0 {
 			data = data[:len(data)-1]
 		}
 		return cc.handleQuery(hack.String(data))
 	case mysql.ComPing:
 		return cc.writeOK()
 	case mysql.ComInitDB:
-		log.Debug("init db", hack.String(data))
 		if err := cc.useDB(hack.String(data)); err != nil {
 			return errors.Trace(err)
 		}
@@ -502,6 +579,32 @@ func (cc *clientConn) writeReq(filePath string) error {
 	return errors.Trace(cc.flush())
 }
 
+var defaultLoadDataBatchCnt = 20000
+
+func insertDataWithCommit(prevData, curData []byte, loadDataInfo *executor.LoadDataInfo) ([]byte, error) {
+	var err error
+	var reachLimit bool
+	for {
+		prevData, reachLimit, err = loadDataInfo.InsertData(prevData, curData)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if !reachLimit {
+			break
+		}
+		// Make sure that there are no retries when committing.
+		if err = loadDataInfo.Ctx.Txn().Commit(); err != nil {
+			return nil, errors.Trace(err)
+		}
+		if err = loadDataInfo.Ctx.NewTxn(); err != nil {
+			return nil, errors.Trace(err)
+		}
+		curData = prevData
+		prevData = nil
+	}
+	return prevData, nil
+}
+
 // handleLoadData does the additional work after processing the 'load data' query.
 // It sends client a file path, then reads the file content from client, inserts data into database.
 func (cc *clientConn) handleLoadData(loadDataInfo *executor.LoadDataInfo) error {
@@ -509,40 +612,29 @@ func (cc *clientConn) handleLoadData(loadDataInfo *executor.LoadDataInfo) error 
 	if cc.capability&mysql.ClientLocalFiles == 0 {
 		return errNotAllowedCommand
 	}
-
-	var err error
-	defer func() {
-		cc.ctx.SetValue(executor.LoadDataVarKey, nil)
-		if err == nil {
-			err = cc.ctx.CommitTxn()
-		}
-		if err == nil {
-			return
-		}
-		err1 := cc.ctx.RollbackTxn()
-		if err1 != nil {
-			log.Errorf("load data rollback failed: %v", err1)
-		}
-	}()
-
 	if loadDataInfo == nil {
-		err = errors.New("load data info is empty")
-		return errors.Trace(err)
+		return errors.New("load data info is empty")
 	}
-	err = cc.writeReq(loadDataInfo.Path)
+
+	err := cc.writeReq(loadDataInfo.Path)
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	var prevData []byte
-	var curData []byte
 	var shouldBreak bool
+	var prevData, curData []byte
+	// TODO: Make the loadDataRowCnt settable.
+	loadDataInfo.SetBatchCount(int64(defaultLoadDataBatchCnt))
+	err = loadDataInfo.Ctx.NewTxn()
+	if err != nil {
+		return errors.Trace(err)
+	}
 	for {
 		curData, err = cc.readPacket()
 		if err != nil {
 			if terror.ErrorNotEqual(err, io.EOF) {
 				log.Error(errors.ErrorStack(err))
-				return errors.Trace(err)
+				break
 			}
 		}
 		if len(curData) == 0 {
@@ -551,37 +643,32 @@ func (cc *clientConn) handleLoadData(loadDataInfo *executor.LoadDataInfo) error 
 				break
 			}
 		}
-		prevData, err = loadDataInfo.InsertData(prevData, curData)
+		prevData, err = insertDataWithCommit(prevData, curData, loadDataInfo)
 		if err != nil {
-			return errors.Trace(err)
+			break
 		}
 		if shouldBreak {
 			break
 		}
 	}
 
-	return nil
+	txn := loadDataInfo.Ctx.Txn()
+	if err != nil {
+		if err1 := txn.Rollback(); err1 != nil {
+			log.Errorf("load data rollback failed: %v", err1)
+		}
+		return errors.Trace(err)
+	}
+	return errors.Trace(txn.Commit())
 }
-
-const queryLogMaxLen = 2048
 
 // handleQuery executes the sql query string and writes result set or result ok to the client.
 // As the execution time of this function represents the performance of TiDB, we do time log and metrics here.
 // There is a special query `load data` that does not return result, which is handled differently.
 func (cc *clientConn) handleQuery(sql string) (err error) {
-	startTS := time.Now()
-	defer func() {
-		// Add metrics
-		queryHistogram.Observe(time.Since(startTS).Seconds())
-		label := querySucc
-		if err != nil {
-			label = queryFailed
-		}
-		queryCounter.WithLabelValues(label).Inc()
-	}()
-
 	rs, err := cc.ctx.Execute(sql)
 	if err != nil {
+		executeErrorCounter.WithLabelValues(executeErrorToLabel(err)).Inc()
 		return errors.Trace(err)
 	}
 	if rs != nil {
@@ -593,20 +680,12 @@ func (cc *clientConn) handleQuery(sql string) (err error) {
 	} else {
 		loadDataInfo := cc.ctx.Value(executor.LoadDataVarKey)
 		if loadDataInfo != nil {
+			defer cc.ctx.SetValue(executor.LoadDataVarKey, nil)
 			if err = cc.handleLoadData(loadDataInfo.(*executor.LoadDataInfo)); err != nil {
 				return errors.Trace(err)
 			}
 		}
 		err = cc.writeOK()
-	}
-	costTime := time.Since(startTS)
-	if len(sql) > queryLogMaxLen {
-		sql = sql[:queryLogMaxLen] + fmt.Sprintf("(len:%d)", len(sql))
-	}
-	if costTime < time.Second {
-		log.Debugf("[%d][TIME_QUERY] %v\n%s", cc.connectionID, costTime, sql)
-	} else {
-		log.Warnf("[%d][TIME_QUERY] %v\n%s", cc.connectionID, costTime, sql)
 	}
 	return errors.Trace(err)
 }
@@ -650,6 +729,7 @@ func (cc *clientConn) writeResultset(rs ResultSet, binary bool, more bool) error
 	if err != nil {
 		return errors.Trace(err)
 	}
+
 	columnLen := dumpLengthEncodedInt(uint64(len(columns)))
 	data := cc.alloc.AllocWithLen(4, 1024)
 	data = append(data, columnLen...)

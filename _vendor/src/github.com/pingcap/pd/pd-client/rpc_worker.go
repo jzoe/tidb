@@ -25,11 +25,14 @@ import (
 	"github.com/pingcap/kvproto/pkg/msgpb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/kvproto/pkg/util"
-	"github.com/pingcap/pd/pkg/metrics"
+	"github.com/pingcap/pd/pkg/metricutil"
 	"github.com/twinj/uuid"
 )
 
-const maxPipelineRequest = 10000
+const (
+	maxPipelineRequest    = 10000
+	maxInitClusterRetries = 300
+)
 
 // errInvalidResponse represents response message is invalid.
 var errInvalidResponse = errors.New("invalid response")
@@ -48,6 +51,12 @@ type storeRequest struct {
 
 type regionRequest struct {
 	pbReq  *pdpb.GetRegionRequest
+	done   chan error
+	pbResp *pdpb.GetRegionResponse
+}
+
+type regionByIDRequest struct {
+	pbReq  *pdpb.GetRegionByIDRequest
 	done   chan error
 	pbResp *pdpb.GetRegionResponse
 }
@@ -170,6 +179,17 @@ func (w *rpcWorker) handleRequests(requests []interface{}, conn *bufio.ReadWrite
 				r.pbResp = regionResp
 				r.done <- nil
 			}
+		case *regionByIDRequest:
+			regionResp, err := w.getRegionByIDFromRemote(conn, r.pbReq)
+			if err != nil {
+				ok = false
+				log.Error(err)
+				r.done <- err
+			} else {
+				r.pbResp = regionResp
+				r.done <- nil
+			}
+
 		case *clusterConfigRequest:
 			clusterConfigResp, err := w.getClusterConfigFromRemote(conn, r.pbReq)
 			if err != nil {
@@ -216,19 +236,26 @@ func newMsgID() uint64 {
 }
 
 func (w *rpcWorker) initClusterID() error {
-	conn := mustNewConn(w.urls, w.quit)
-	if conn == nil {
-		return errors.New("client closed")
-	}
-	defer conn.Close()
+	for i := 0; i < maxInitClusterRetries; i++ {
+		conn := mustNewConn(w.urls, w.quit)
+		if conn == nil {
+			return errors.New("client closed")
+		}
 
-	clusterID, err := w.getClusterID(conn.ReadWriter)
-	if err != nil {
-		return errors.Trace(err)
+		clusterID, err := w.getClusterID(conn.ReadWriter)
+		// We need to close this connection no matter success or not.
+		conn.Close()
+
+		if err == nil {
+			w.clusterID = clusterID
+			return nil
+		}
+
+		log.Errorf("[pd] failed to get cluster id: %v", err)
+		time.Sleep(time.Second)
 	}
 
-	w.clusterID = clusterID
-	return nil
+	return errors.New("failed to get cluster id")
 }
 
 func (w *rpcWorker) getClusterID(conn *bufio.ReadWriter) (uint64, error) {
@@ -316,6 +343,25 @@ func (w *rpcWorker) getRegionFromRemote(conn *bufio.ReadWriter, regionReq *pdpb.
 	return rsp.GetGetRegion(), nil
 }
 
+func (w *rpcWorker) getRegionByIDFromRemote(conn *bufio.ReadWriter, regionReq *pdpb.GetRegionByIDRequest) (*pdpb.GetRegionResponse, error) {
+	req := &pdpb.Request{
+		Header: &pdpb.RequestHeader{
+			Uuid:      uuid.NewV4().Bytes(),
+			ClusterId: w.clusterID,
+		},
+		CmdType:       pdpb.CommandType_GetRegionByID,
+		GetRegionById: regionReq,
+	}
+	rsp, err := w.callRPC(conn, req)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if rsp.GetGetRegionById() == nil {
+		return nil, errors.New("[pd] GetRegion field in rpc response not set")
+	}
+	return rsp.GetGetRegionById(), nil
+}
+
 func (w *rpcWorker) getClusterConfigFromRemote(conn *bufio.ReadWriter, clusterConfigReq *pdpb.GetClusterConfigRequest) (*pdpb.GetClusterConfigResponse, error) {
 	req := &pdpb.Request{
 		Header: &pdpb.RequestHeader{
@@ -338,7 +384,7 @@ func (w *rpcWorker) getClusterConfigFromRemote(conn *bufio.ReadWriter, clusterCo
 func (w *rpcWorker) callRPC(conn *bufio.ReadWriter, req *pdpb.Request) (resp *pdpb.Response, err error) {
 	// Record some metrics.
 	start := time.Now()
-	label := metrics.GetCmdLabel(req)
+	label := metricutil.GetCmdLabel(req)
 	defer func() {
 		if err == nil {
 			cmdCounter.WithLabelValues(label).Inc()

@@ -14,13 +14,14 @@
 package tikv
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"time"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
-	"golang.org/x/net/context"
+	goctx "golang.org/x/net/context"
 )
 
 const (
@@ -71,6 +72,7 @@ type backoffType int
 const (
 	boTiKVRPC backoffType = iota
 	boTxnLock
+	boTxnLockFast
 	boPDRPC
 	boRegionMiss
 	boServerBusy
@@ -81,7 +83,9 @@ func (t backoffType) createFn() func() int {
 	case boTiKVRPC:
 		return NewBackoffFn(100, 2000, EqualJitter)
 	case boTxnLock:
-		return NewBackoffFn(300, 3000, EqualJitter)
+		return NewBackoffFn(200, 3000, EqualJitter)
+	case boTxnLockFast:
+		return NewBackoffFn(100, 3000, EqualJitter)
 	case boPDRPC:
 		return NewBackoffFn(500, 3000, EqualJitter)
 	case boRegionMiss:
@@ -98,6 +102,8 @@ func (t backoffType) String() string {
 		return "tikvRPC"
 	case boTxnLock:
 		return "txnLock"
+	case boTxnLockFast:
+		return "txnLockFast"
 	case boPDRPC:
 		return "pdRPC"
 	case boRegionMiss:
@@ -112,15 +118,17 @@ func (t backoffType) String() string {
 const (
 	copBuildTaskMaxBackoff  = 5000
 	tsoMaxBackoff           = 5000
-	scannerNextMaxBackoff   = 5000
-	batchGetMaxBackoff      = 10000
-	copNextMaxBackoff       = 10000
-	getMaxBackoff           = 10000
-	prewriteMaxBackoff      = 10000
-	commitMaxBackoff        = 10000
-	cleanupMaxBackoff       = 10000
+	scannerNextMaxBackoff   = 15000
+	batchGetMaxBackoff      = 15000
+	copNextMaxBackoff       = 15000
+	getMaxBackoff           = 15000
+	prewriteMaxBackoff      = 15000
+	commitMaxBackoff        = 15000
+	commitPrimaryMaxBackoff = -1
+	cleanupMaxBackoff       = 15000
 	gcMaxBackoff            = 100000
 	gcResolveLockMaxBackoff = 100000
+	rawkvMaxBackoff         = 15000
 )
 
 // Backoffer is a utility for retrying queries.
@@ -129,11 +137,12 @@ type Backoffer struct {
 	maxSleep   int
 	totalSleep int
 	errors     []error
-	ctx        context.Context
+	ctx        goctx.Context
+	types      []backoffType
 }
 
 // NewBackoffer creates a Backoffer with maximum sleep time(in ms).
-func NewBackoffer(maxSleep int, ctx context.Context) *Backoffer {
+func NewBackoffer(maxSleep int, ctx goctx.Context) *Backoffer {
 	return &Backoffer{
 		maxSleep: maxSleep,
 		ctx:      ctx,
@@ -141,9 +150,9 @@ func NewBackoffer(maxSleep int, ctx context.Context) *Backoffer {
 }
 
 // WithCancel returns a cancel function which, when called, would cancel backoffer's context.
-func (b *Backoffer) WithCancel() context.CancelFunc {
-	var cancel context.CancelFunc
-	b.ctx, cancel = context.WithCancel(b.ctx)
+func (b *Backoffer) WithCancel() goctx.CancelFunc {
+	var cancel goctx.CancelFunc
+	b.ctx, cancel = goctx.WithCancel(b.ctx)
 	return cancel
 }
 
@@ -151,8 +160,6 @@ func (b *Backoffer) WithCancel() context.CancelFunc {
 // It returns a retryable error if total sleep time exceeds maxSleep.
 func (b *Backoffer) Backoff(typ backoffType, err error) error {
 	backoffCounter.WithLabelValues(typ.String()).Inc()
-	start := time.Now()
-	defer func() { backoffHistogram.WithLabelValues(typ.String()).Observe(time.Since(start).Seconds()) }()
 	// Lazy initialize.
 	if b.fn == nil {
 		b.fn = make(map[backoffType]func() int)
@@ -164,14 +171,28 @@ func (b *Backoffer) Backoff(typ backoffType, err error) error {
 	}
 
 	b.totalSleep += f()
+	b.types = append(b.types, typ)
 
-	log.Warnf("%v, retry later(totalSleep %dms, maxSleep %dms)", err, b.totalSleep, b.maxSleep)
+	log.Debugf("%v, retry later(totalSleep %dms, maxSleep %dms)", err, b.totalSleep, b.maxSleep)
 	b.errors = append(b.errors, err)
-	if b.totalSleep >= b.maxSleep {
-		e := errors.Errorf("backoffer.maxSleep %dms is exceeded, errors: %v", b.maxSleep, b.errors)
-		return errors.Annotate(e, txnRetryableMark)
+	if b.maxSleep > 0 && b.totalSleep >= b.maxSleep {
+		errMsg := fmt.Sprintf("backoffer.maxSleep %dms is exceeded, errors:", b.maxSleep)
+		for i, err := range b.errors {
+			// Print only last 3 errors for non-DEBUG log levels.
+			if log.GetLogLevel() >= log.LOG_LEVEL_DEBUG || i >= len(b.errors)-3 {
+				errMsg += "\n" + err.Error()
+			}
+		}
+		return errors.Annotate(errors.New(errMsg), txnRetryableMark)
 	}
 	return nil
+}
+
+func (b *Backoffer) String() string {
+	if b.totalSleep == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" backoff(%dms %s)", b.totalSleep, b.types)
 }
 
 // Fork creates a new Backoffer which keeps current Backoffer's sleep time and errors.

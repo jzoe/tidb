@@ -19,6 +19,7 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/util/types"
@@ -41,7 +42,7 @@ type validator struct {
 }
 
 func (v *validator) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
-	switch in.(type) {
+	switch node := in.(type) {
 	case *ast.AggregateFuncExpr:
 		if v.inAggregate {
 			// Aggregate function can not contain aggregate function.
@@ -50,12 +51,17 @@ func (v *validator) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
 		}
 		v.inAggregate = true
 	case *ast.CreateTableStmt:
-		v.checkCreateTableGrammar(in.(*ast.CreateTableStmt))
+		v.checkCreateTableGrammar(node)
 		if v.err != nil {
 			return in, true
 		}
 	case *ast.CreateIndexStmt:
-		v.checkCreateIndexGrammar(in.(*ast.CreateIndexStmt))
+		v.checkCreateIndexGrammar(node)
+		if v.err != nil {
+			return in, true
+		}
+	case *ast.AlterTableStmt:
+		v.checkAlterTableGrammar(node)
 		if v.err != nil {
 			return in, true
 		}
@@ -72,10 +78,25 @@ func (v *validator) Leave(in ast.Node) (out ast.Node, ok bool) {
 	case *ast.ParamMarkerExpr:
 		if !v.inPrepare {
 			v.err = parser.ErrSyntax.Gen("syntax error, unexpected '?'")
+			return
 		}
 	case *ast.Limit:
-		if x.Count > math.MaxUint64-x.Offset {
-			x.Count = math.MaxUint64 - x.Offset
+		if x.Count == nil {
+			break
+		}
+		if _, isParamMarker := x.Count.(*ast.ParamMarkerExpr); isParamMarker {
+			break
+		}
+		// We only accept ? and uint64 for count/offset in parser.y
+		var count, offset uint64
+		if x.Count != nil {
+			count, _ = x.Count.GetValue().(uint64)
+		}
+		if x.Offset != nil {
+			offset, _ = x.Offset.GetValue().(uint64)
+		}
+		if count > math.MaxUint64-offset {
+			x.Count.SetValue(math.MaxUint64 - offset)
 		}
 	}
 
@@ -91,12 +112,15 @@ func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
 			return hasAutoIncrement, nil
 		}
 		for _, op := range colDef.Options[num+1:] {
-			if op.Tp == ast.ColumnOptionDefaultValue {
+			if op.Tp == ast.ColumnOptionDefaultValue && !op.Expr.GetDatum().IsNull() {
 				return hasAutoIncrement, errors.Errorf("Invalid default value for '%s'", colDef.Name.Name.O)
 			}
 		}
 	}
 	if colDef.Options[num].Tp == ast.ColumnOptionDefaultValue && len(colDef.Options) != num+1 {
+		if colDef.Options[num].Expr.GetDatum().IsNull() {
+			return hasAutoIncrement, nil
+		}
 		for _, op := range colDef.Options[num+1:] {
 			if op.Tp == ast.ColumnOptionAutoIncrement {
 				return hasAutoIncrement, errors.Errorf("Invalid default value for '%s'", colDef.Name.Name.O)
@@ -181,7 +205,7 @@ func (v *validator) checkAutoIncrement(stmt *ast.CreateTableStmt) {
 }
 
 func (v *validator) checkCreateTableGrammar(stmt *ast.CreateTableStmt) {
-	countPrimayKey := 0
+	countPrimaryKey := 0
 	for _, colDef := range stmt.Cols {
 		tp := colDef.Tp
 		if tp.Tp == mysql.TypeString &&
@@ -189,10 +213,31 @@ func (v *validator) checkCreateTableGrammar(stmt *ast.CreateTableStmt) {
 			v.err = errors.Errorf("Column length too big for column '%s' (max = 255); use BLOB or TEXT instead", colDef.Name.Name.O)
 			return
 		}
-		countPrimayKey += isPrimary(colDef.Options)
-		if countPrimayKey > 1 {
-			v.err = errors.Errorf("Multiple primary key defined")
+		countPrimaryKey += isPrimary(colDef.Options)
+		if countPrimaryKey > 1 {
+			v.err = infoschema.ErrMultiplePriKey
 			return
+		}
+	}
+	for _, constraint := range stmt.Constraints {
+		switch tp := constraint.Tp; tp {
+		case ast.ConstraintKey, ast.ConstraintIndex, ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex:
+			err := checkDuplicateColumnName(constraint.Keys)
+			if err != nil {
+				v.err = err
+				return
+			}
+		case ast.ConstraintPrimaryKey:
+			if countPrimaryKey > 0 {
+				v.err = infoschema.ErrMultiplePriKey
+				return
+			}
+			countPrimaryKey++
+			err := checkDuplicateColumnName(constraint.Keys)
+			if err != nil {
+				v.err = err
+				return
+			}
 		}
 	}
 }
@@ -207,14 +252,41 @@ func isPrimary(ops []*ast.ColumnOption) int {
 }
 
 func (v *validator) checkCreateIndexGrammar(stmt *ast.CreateIndexStmt) {
-	for i := 0; i < len(stmt.IndexColNames); i++ {
-		name1 := stmt.IndexColNames[i].Column.Name
-		for j := i + 1; j < len(stmt.IndexColNames); j++ {
-			name2 := stmt.IndexColNames[j].Column.Name
+	v.err = checkDuplicateColumnName(stmt.IndexColNames)
+	return
+}
+
+func (v *validator) checkAlterTableGrammar(stmt *ast.AlterTableStmt) {
+	specs := stmt.Specs
+	for _, spec := range specs {
+		switch spec.Tp {
+		case ast.AlterTableAddConstraint:
+			switch spec.Constraint.Tp {
+			case ast.ConstraintKey, ast.ConstraintIndex, ast.ConstraintUniq, ast.ConstraintUniqIndex,
+				ast.ConstraintUniqKey:
+				v.err = checkDuplicateColumnName(spec.Constraint.Keys)
+				if v.err != nil {
+					return
+				}
+			default:
+				// Nothing to do now.
+			}
+		default:
+			// Nothing to do now.
+		}
+	}
+}
+
+// checkDuplicateColumnName checks if index exists duplicated columns.
+func checkDuplicateColumnName(indexColNames []*ast.IndexColName) error {
+	for i := 0; i < len(indexColNames); i++ {
+		name1 := indexColNames[i].Column.Name
+		for j := i + 1; j < len(indexColNames); j++ {
+			name2 := indexColNames[j].Column.Name
 			if name1.L == name2.L {
-				v.err = errors.Errorf("Duplicate column name '%s'", name1.O)
-				return
+				return infoschema.ErrColumnExists.GenByArgs(name2)
 			}
 		}
 	}
+	return nil
 }

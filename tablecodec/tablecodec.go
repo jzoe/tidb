@@ -15,6 +15,7 @@ package tablecodec
 
 import (
 	"bytes"
+	"math"
 	"time"
 
 	"github.com/juju/errors"
@@ -26,6 +27,7 @@ import (
 )
 
 var (
+	errInvalidKey         = terror.ClassXEval.New(codeInvalidKey, "invalid key")
 	errInvalidRecordKey   = terror.ClassXEval.New(codeInvalidRecordKey, "invalid record key")
 	errInvalidColumnCount = terror.ClassXEval.New(codeInvalidColumnCount, "invalid column count")
 )
@@ -41,6 +43,11 @@ const (
 	prefixLen       = 1 + idLen /*tableID*/ + 2
 	recordRowKeyLen = prefixLen + idLen /*handle*/
 )
+
+// TablePrefix returns table's prefix 't'.
+func TablePrefix() []byte {
+	return tablePrefix
+}
 
 // EncodeRowKey encodes the table id and record handle into a kv.Key
 func EncodeRowKey(tableID int64, encodedHandle []byte) kv.Key {
@@ -92,6 +99,51 @@ func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 	return
 }
 
+// DecodeKeyHead decodes the key's head and gets the tableID, indexID. isRecordKey is true when is a record key.
+func DecodeKeyHead(key kv.Key) (tableID int64, indexID int64, isRecordKey bool, err error) {
+	isRecordKey = false
+	k := key
+	if !key.HasPrefix(tablePrefix) {
+		err = errInvalidKey.Gen("invalid key - %q", k)
+		return
+	}
+
+	key = key[len(tablePrefix):]
+	key, tableID, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errors.Trace(err)
+		return
+	}
+
+	if key.HasPrefix(recordPrefixSep) {
+		isRecordKey = true
+		return
+	}
+	if !key.HasPrefix(indexPrefixSep) {
+		err = errInvalidKey.Gen("invalid key - %q", k)
+		return
+	}
+
+	key = key[len(indexPrefixSep):]
+
+	key, indexID, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errors.Trace(err)
+		return
+	}
+	return
+}
+
+// DecodeTableID decodes the table ID of the key, if the key is not table key, returns 0.
+func DecodeTableID(key kv.Key) int64 {
+	if !key.HasPrefix(tablePrefix) {
+		return 0
+	}
+	key = key[len(tablePrefix):]
+	_, tableID, _ := codec.DecodeInt(key)
+	return tableID
+}
+
 // DecodeRowKey decodes the key and gets the handle.
 func DecodeRowKey(key kv.Key) (int64, error) {
 	_, handle, err := DecodeRecordKey(key)
@@ -136,7 +188,8 @@ func flatten(data types.Datum) (types.Datum, error) {
 	switch data.Kind() {
 	case types.KindMysqlTime:
 		// for mysql datetime, timestamp and date type
-		return types.NewUintDatum(data.GetMysqlTime().ToPackedUint()), nil
+		v, err := data.GetMysqlTime().ToPackedUint()
+		return types.NewUintDatum(v), errors.Trace(err)
 	case types.KindMysqlDuration:
 		// for mysql time type
 		data.SetInt64(int64(data.GetMysqlDuration().Duration))
@@ -300,7 +353,7 @@ func Unflatten(datum types.Datum, ft *types.FieldType, inIndex bool) (types.Datu
 		mysql.TypeString:
 		return datum, nil
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeTimestamp:
-		var t mysql.Time
+		var t types.Time
 		t.Type = ft.Tp
 		t.Fsp = ft.Decimal
 		var err error
@@ -311,25 +364,25 @@ func Unflatten(datum types.Datum, ft *types.FieldType, inIndex bool) (types.Datu
 		datum.SetMysqlTime(t)
 		return datum, nil
 	case mysql.TypeDuration:
-		dur := mysql.Duration{Duration: time.Duration(datum.GetInt64())}
+		dur := types.Duration{Duration: time.Duration(datum.GetInt64())}
 		datum.SetValue(dur)
 		return datum, nil
 	case mysql.TypeEnum:
-		enum, err := mysql.ParseEnumValue(ft.Elems, datum.GetUint64())
+		enum, err := types.ParseEnumValue(ft.Elems, datum.GetUint64())
 		if err != nil {
 			return datum, errors.Trace(err)
 		}
 		datum.SetValue(enum)
 		return datum, nil
 	case mysql.TypeSet:
-		set, err := mysql.ParseSetValue(ft.Elems, datum.GetUint64())
+		set, err := types.ParseSetValue(ft.Elems, datum.GetUint64())
 		if err != nil {
 			return datum, errors.Trace(err)
 		}
 		datum.SetValue(set)
 		return datum, nil
 	case mysql.TypeBit:
-		bit := mysql.Bit{Value: datum.GetUint64(), Width: ft.Flen}
+		bit := types.Bit{Value: datum.GetUint64(), Width: ft.Flen}
 		datum.SetValue(bit)
 		return datum, nil
 	}
@@ -420,6 +473,24 @@ func TruncateToRowKeyLen(key kv.Key) kv.Key {
 	return key
 }
 
+// GetTableHandleKeyRange returns table handle's key range with tableID.
+func GetTableHandleKeyRange(tableID int64) (startKey, endKey []byte) {
+	tableStartKey := EncodeRowKeyWithHandle(tableID, math.MinInt64)
+	tableEndKey := EncodeRowKeyWithHandle(tableID, math.MaxInt64)
+	startKey = codec.EncodeBytes(nil, tableStartKey)
+	endKey = codec.EncodeBytes(nil, tableEndKey)
+	return
+}
+
+// GetTableIndexKeyRange returns table index's key range with tableID and indexID.
+func GetTableIndexKeyRange(tableID, indexID int64) (startKey, endKey []byte) {
+	start := EncodeIndexSeekKey(tableID, indexID, nil)
+	end := EncodeIndexSeekKey(tableID, indexID, []byte{255})
+	startKey = codec.EncodeBytes(nil, start)
+	endKey = codec.EncodeBytes(nil, end)
+	return
+}
+
 type keyRangeSorter struct {
 	ranges []kv.KeyRange
 }
@@ -442,4 +513,5 @@ func (r *keyRangeSorter) Swap(i, j int) {
 const (
 	codeInvalidRecordKey   = 4
 	codeInvalidColumnCount = 5
+	codeInvalidKey         = 6
 )

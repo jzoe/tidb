@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/pd/pd-client"
 )
@@ -64,11 +63,13 @@ func (c *pdClient) GetRegion(key []byte) (*metapb.Region, *metapb.Peer, error) {
 	return region, peer, nil
 }
 
+func (c *pdClient) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer, error) {
+	region, peer := c.cluster.GetRegionByID(regionID)
+	return region, peer, nil
+}
+
 func (c *pdClient) GetStore(storeID uint64) (*metapb.Store, error) {
 	store := c.cluster.GetStore(storeID)
-	if store == nil {
-		return nil, errors.New("not found")
-	}
 	return store, nil
 }
 
